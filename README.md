@@ -70,5 +70,3 @@ INIT -> MOVE_TO_SAFE -> APPROACH -> PICK -> GRASP -> LIFT -> DONE
 - 纸箱尺寸和生成位置
 - 吸盘吸附距离阈值
 - 运动速度参数
-
-cmdkey /generic:git:https://github.com /user:YellowThree-HS /pass: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

@@ -113,3 +113,102 @@ class BoxGenerator:
         if name in self._boxes:
             return self._boxes[name]["prim_path"]
         return None
+
+    def create_random_boxes(
+        self,
+        count: int = 10,
+        center: list = None,
+        spread: float = 0.3,
+        drop_height: float = 0.5,
+        size_range: tuple = ((0.08, 0.15), (0.06, 0.12), (0.05, 0.10)),
+        mass_range: tuple = (0.5, 2.0)
+    ) -> list:
+        """
+        批量生成随机大小的纸箱从半空中掉落
+
+        Args:
+            count: 纸箱数量
+            center: 掉落中心位置 [x, y]
+            spread: 水平散布范围
+            drop_height: 掉落起始高度
+            size_range: 尺寸范围 ((长min,长max), (宽min,宽max), (高min,高max))
+            mass_range: 质量范围 (min, max)
+
+        Returns:
+            list: 所有纸箱的prim路径列表
+        """
+        if center is None:
+            center = [0.4, 0.0]
+
+        box_paths = []
+        colors = [
+            [0.6, 0.4, 0.2, 1.0],   # 棕色
+            [0.7, 0.5, 0.3, 1.0],   # 浅棕色
+            [0.5, 0.35, 0.2, 1.0],  # 深棕色
+            [0.65, 0.45, 0.25, 1.0], # 中棕色
+        ]
+
+        for i in range(count):
+            # 随机尺寸
+            size = [
+                np.random.uniform(size_range[0][0], size_range[0][1]),
+                np.random.uniform(size_range[1][0], size_range[1][1]),
+                np.random.uniform(size_range[2][0], size_range[2][1])
+            ]
+
+            # 随机位置（在中心点周围散布，高度递增避免初始碰撞）
+            pos_x = center[0] + np.random.uniform(-spread, spread)
+            pos_y = center[1] + np.random.uniform(-spread, spread)
+            pos_z = drop_height + i * 0.05 + size[2] / 2  # 递增高度（每个+5cm）
+
+            # 随机质量
+            mass = np.random.uniform(mass_range[0], mass_range[1])
+
+            # 随机颜色
+            color = colors[i % len(colors)]
+
+            # 创建纸箱
+            path = self.create_box(
+                name=f"box_{i}",
+                position=[pos_x, pos_y, pos_z],
+                size=size,
+                mass=mass,
+                color=color
+            )
+            box_paths.append(path)
+
+        print(f"Created {count} random boxes dropping from height {drop_height}m")
+        return box_paths
+
+    def get_topmost_box(self) -> tuple:
+        """
+        获取最上面的纸箱（Z坐标最高）
+
+        Returns:
+            tuple: (prim_path, position, size) 或 None
+        """
+        if not self._boxes:
+            return None
+
+        topmost = None
+        max_z = -float('inf')
+
+        stage = omni.usd.get_context().get_stage()
+
+        for name, info in self._boxes.items():
+            prim = stage.GetPrimAtPath(info["prim_path"])
+            if prim.IsValid():
+                xformable = UsdGeom.Xformable(prim)
+                transform = xformable.ComputeLocalToWorldTransform(0)
+                pos = transform.ExtractTranslation()
+                # 计算箱子顶面高度
+                top_z = pos[2] + info["size"][2] / 2
+                if top_z > max_z:
+                    max_z = top_z
+                    topmost = (
+                        info["prim_path"],
+                        np.array([pos[0], pos[1], pos[2]]),
+                        info["size"]
+                    )
+
+        return topmost
