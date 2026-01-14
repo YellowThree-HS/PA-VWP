@@ -131,38 +131,79 @@ class SuctionGripper:
         else:
             print("  Warning: PhysicsScene not found, collision filtering skipped")
 
-    def _calculate_distance(self, target_prim_path: str) -> float:
-        """计算吸盘到目标物体顶面的垂直距离"""
+    def _calculate_distance(self, target_prim_path: str, grasp_direction: str = "top") -> float:
+        """
+        计算吸盘到目标物体吸取面的距离
+
+        Args:
+            target_prim_path: 目标物体路径
+            grasp_direction: 吸取方向 "top" 或 "side_*"
+        """
         gripper_pos = self.get_gripper_position()
         target_pos = self._get_object_position(target_prim_path)
         if target_pos is None:
             return float('inf')
 
-        # 获取箱子顶面Z坐标
-        top_z = self._get_object_top_z(target_prim_path)
-        if top_z is None:
-            top_z = target_pos[2]
-
-        # 计算水平距离和垂直距离（到顶面）
-        horizontal_dist = np.sqrt(
-            (gripper_pos[0] - target_pos[0])**2 +
-            (gripper_pos[1] - target_pos[1])**2
-        )
-        vertical_dist = abs(gripper_pos[2] - top_z)
-
         print(f"  Gripper pos: {gripper_pos}")
-        print(f"  Target center: {target_pos}, top_z: {top_z:.4f}")
-        print(f"  Horizontal dist: {horizontal_dist:.4f}m, Vertical dist to top: {vertical_dist:.4f}m")
+        print(f"  Target center: {target_pos}")
+        print(f"  Grasp direction: {grasp_direction}")
 
-        # 主要检查垂直距离（吸盘朝下，到顶面的距离）
-        return vertical_dist
+        if grasp_direction == "top":
+            # 顶面吸取：检查垂直距离
+            top_z = self._get_object_top_z(target_prim_path)
+            if top_z is None:
+                top_z = target_pos[2]
+            vertical_dist = abs(gripper_pos[2] - top_z)
+            print(f"  Vertical dist to top: {vertical_dist:.4f}m")
+            return vertical_dist
+        else:
+            # 侧面吸取：检查到侧面的距离
+            return self._calculate_side_distance(gripper_pos, target_prim_path, grasp_direction)
 
-    def activate(self, target_prim_path: str) -> bool:
+    def _calculate_side_distance(self, gripper_pos: np.ndarray, target_prim_path: str, direction: str) -> float:
+        """计算到侧面的距离"""
+        stage = omni.usd.get_context().get_stage()
+        target_pos = self._get_object_position(target_prim_path)
+
+        # 获取箱子尺寸
+        geom_path = f"{target_prim_path}/geometry"
+        geom_prim = stage.GetPrimAtPath(geom_path)
+        half_size = [0.1, 0.1, 0.1]  # 默认值
+
+        if geom_prim.IsValid():
+            geom_xform = UsdGeom.Xformable(geom_prim)
+            for op in geom_xform.GetOrderedXformOps():
+                if op.GetOpType() == UsdGeom.XformOp.TypeScale:
+                    s = op.Get()
+                    half_size = [s[0]/2, s[1]/2, s[2]/2]
+                    break
+
+        # 根据方向计算侧面位置
+        if "back" in direction:
+            side_pos = target_pos[0] - half_size[0]
+            dist = abs(gripper_pos[0] - side_pos)
+        elif "front" in direction:
+            side_pos = target_pos[0] + half_size[0]
+            dist = abs(gripper_pos[0] - side_pos)
+        elif "left" in direction:
+            side_pos = target_pos[1] - half_size[1]
+            dist = abs(gripper_pos[1] - side_pos)
+        elif "right" in direction:
+            side_pos = target_pos[1] + half_size[1]
+            dist = abs(gripper_pos[1] - side_pos)
+        else:
+            dist = np.linalg.norm(gripper_pos - target_pos)
+
+        print(f"  Side distance ({direction}): {dist:.4f}m")
+        return dist
+
+    def activate(self, target_prim_path: str, grasp_direction: str = "top") -> bool:
         """
         激活吸盘，吸附目标物体（带距离检测）
 
         Args:
             target_prim_path: 要吸附的物体路径
+            grasp_direction: 吸取方向 "top" 或 "side_*"
 
         Returns:
             bool: 是否成功吸附
@@ -172,7 +213,7 @@ class SuctionGripper:
             return False
 
         # 检查距离
-        distance = self._calculate_distance(target_prim_path)
+        distance = self._calculate_distance(target_prim_path, grasp_direction)
         print(f"Distance to target: {distance:.4f}m (threshold: {self.grip_threshold}m)")
 
         if distance > self.grip_threshold:

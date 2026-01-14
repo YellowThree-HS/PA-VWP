@@ -180,9 +180,12 @@ class BoxGenerator:
         print(f"Created {count} random boxes dropping from height {drop_height}m")
         return box_paths
 
-    def get_topmost_box(self) -> tuple:
+    def get_topmost_box(self, exclude_paths: list = None) -> tuple:
         """
         获取最上面的纸箱（Z坐标最高）
+
+        Args:
+            exclude_paths: 要排除的箱子路径列表
 
         Returns:
             tuple: (prim_path, position, size) 或 None
@@ -190,12 +193,17 @@ class BoxGenerator:
         if not self._boxes:
             return None
 
+        if exclude_paths is None:
+            exclude_paths = []
+
         topmost = None
         max_z = -float('inf')
 
         stage = omni.usd.get_context().get_stage()
 
         for name, info in self._boxes.items():
+            if info["prim_path"] in exclude_paths:
+                continue
             prim = stage.GetPrimAtPath(info["prim_path"])
             if prim.IsValid():
                 xformable = UsdGeom.Xformable(prim)
@@ -212,3 +220,182 @@ class BoxGenerator:
                     )
 
         return topmost
+
+    def get_unstable_graspable_box(self, exclude_paths: list = None) -> tuple:
+        """
+        获取边缘支撑箱子（抓取后会导致其他箱子倒塌）
+        返回箱子信息和最佳吸取方向
+
+        Args:
+            exclude_paths: 要排除的箱子路径列表
+
+        Returns:
+            tuple: (prim_path, position, size, grasp_info) 或 None
+            grasp_info: {"direction": "top"/"side", "approach_vector": [x,y,z]}
+        """
+        if not self._boxes:
+            return None
+
+        if exclude_paths is None:
+            exclude_paths = []
+
+        stage = omni.usd.get_context().get_stage()
+
+        # 收集所有箱子信息
+        box_infos = []
+        for name, info in self._boxes.items():
+            if info["prim_path"] in exclude_paths:
+                continue
+            prim = stage.GetPrimAtPath(info["prim_path"])
+            if prim.IsValid():
+                xformable = UsdGeom.Xformable(prim)
+                transform = xformable.ComputeLocalToWorldTransform(0)
+                pos = transform.ExtractTranslation()
+                box_infos.append({
+                    "prim_path": info["prim_path"],
+                    "pos": np.array([pos[0], pos[1], pos[2]]),
+                    "size": info["size"],
+                    "top_z": pos[2] + info["size"][2] / 2,
+                    "bottom_z": pos[2] - info["size"][2] / 2
+                })
+
+        if not box_infos:
+            return None
+
+        # 分析每个箱子的可抓取性和不稳定性
+        candidates = []
+        for box in box_infos:
+            analysis = self._analyze_box_graspability(box, box_infos)
+            if analysis["has_box_above"] and analysis["grasp_direction"]:
+                candidates.append({
+                    **box,
+                    **analysis
+                })
+
+        if not candidates:
+            # 没找到理想的，返回最底部有暴露面的箱子
+            return self._get_fallback_box(box_infos)
+
+        # 优先选择支撑箱子数量多的（倒塌效果更明显）
+        candidates.sort(key=lambda x: x["boxes_above_count"], reverse=True)
+        best = candidates[0]
+
+        grasp_info = {
+            "direction": best["grasp_direction"],
+            "approach_vector": best["approach_vector"],
+            "grasp_point": best["grasp_point"]
+        }
+
+        return (best["prim_path"], best["pos"], best["size"], grasp_info)
+
+    def _analyze_box_graspability(self, box: dict, all_boxes: list) -> dict:
+        """
+        分析单个箱子的可抓取性
+        检查顶面和四个侧面是否暴露，以及上方是否有箱子
+        """
+        result = {
+            "has_box_above": False,
+            "boxes_above_count": 0,
+            "grasp_direction": None,
+            "approach_vector": None,
+            "grasp_point": None,
+            "top_exposed": True,
+            "side_exposed": {"front": True, "back": True, "left": True, "right": True}
+        }
+
+        box_pos = box["pos"]
+        box_size = box["size"]
+        half_size = np.array(box_size) / 2
+
+        # 检查每个其他箱子
+        for other in all_boxes:
+            if other["prim_path"] == box["prim_path"]:
+                continue
+
+            other_pos = other["pos"]
+            other_size = other["size"]
+            other_half = np.array(other_size) / 2
+
+            # 检查是否在上方（有重叠）
+            if other_pos[2] > box_pos[2]:
+                dx = abs(other_pos[0] - box_pos[0])
+                dy = abs(other_pos[1] - box_pos[1])
+                overlap_x = half_size[0] + other_half[0]
+                overlap_y = half_size[1] + other_half[1]
+
+                if dx < overlap_x * 0.8 and dy < overlap_y * 0.8:
+                    result["has_box_above"] = True
+                    result["boxes_above_count"] += 1
+                    # 顶面被遮挡
+                    if dx < half_size[0] and dy < half_size[1]:
+                        result["top_exposed"] = False
+
+            # 检查侧面遮挡（同一高度层的箱子）
+            z_overlap = (abs(other_pos[2] - box_pos[2]) <
+                        (half_size[2] + other_half[2]) * 0.8)
+            if z_overlap:
+                # front (x+方向)
+                if (other_pos[0] > box_pos[0] and
+                    other_pos[0] - box_pos[0] < half_size[0] + other_half[0] + 0.05):
+                    if abs(other_pos[1] - box_pos[1]) < half_size[1] + other_half[1]:
+                        result["side_exposed"]["front"] = False
+                # back (x-方向)
+                if (other_pos[0] < box_pos[0] and
+                    box_pos[0] - other_pos[0] < half_size[0] + other_half[0] + 0.05):
+                    if abs(other_pos[1] - box_pos[1]) < half_size[1] + other_half[1]:
+                        result["side_exposed"]["back"] = False
+                # right (y+方向)
+                if (other_pos[1] > box_pos[1] and
+                    other_pos[1] - box_pos[1] < half_size[1] + other_half[1] + 0.05):
+                    if abs(other_pos[0] - box_pos[0]) < half_size[0] + other_half[0]:
+                        result["side_exposed"]["right"] = False
+                # left (y-方向)
+                if (other_pos[1] < box_pos[1] and
+                    box_pos[1] - other_pos[1] < half_size[1] + other_half[1] + 0.05):
+                    if abs(other_pos[0] - box_pos[0]) < half_size[0] + other_half[0]:
+                        result["side_exposed"]["left"] = False
+
+        # 确定最佳抓取方向
+        if result["top_exposed"]:
+            result["grasp_direction"] = "top"
+            result["approach_vector"] = np.array([0, 0, -1])
+            result["grasp_point"] = np.array([
+                box_pos[0], box_pos[1], box_pos[2] + half_size[2]
+            ])
+        else:
+            # 选择暴露的侧面，优先选择朝向机械臂的方向(back, x-方向)
+            side_priority = ["back", "left", "right", "front"]
+            side_vectors = {
+                "front": np.array([1, 0, 0]),
+                "back": np.array([-1, 0, 0]),
+                "left": np.array([0, -1, 0]),
+                "right": np.array([0, 1, 0])
+            }
+            side_offsets = {
+                "front": np.array([half_size[0], 0, 0]),
+                "back": np.array([-half_size[0], 0, 0]),
+                "left": np.array([0, -half_size[1], 0]),
+                "right": np.array([0, half_size[1], 0])
+            }
+
+            for side in side_priority:
+                if result["side_exposed"][side]:
+                    result["grasp_direction"] = f"side_{side}"
+                    result["approach_vector"] = -side_vectors[side]
+                    result["grasp_point"] = box_pos + side_offsets[side]
+                    break
+
+        return result
+
+    def _get_fallback_box(self, box_infos: list) -> tuple:
+        """当没有理想候选时，返回一个有暴露面的箱子"""
+        for box in sorted(box_infos, key=lambda x: x["top_z"]):
+            analysis = self._analyze_box_graspability(box, box_infos)
+            if analysis["grasp_direction"]:
+                grasp_info = {
+                    "direction": analysis["grasp_direction"],
+                    "approach_vector": analysis["approach_vector"],
+                    "grasp_point": analysis["grasp_point"]
+                }
+                return (box["prim_path"], box["pos"], box["size"], grasp_info)
+        return None

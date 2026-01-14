@@ -244,7 +244,8 @@ class UR5eController:
     def move_to_pose(
         self,
         target_position: np.ndarray,
-        target_orientation: np.ndarray = None
+        target_orientation: np.ndarray = None,
+        approach_direction: str = "top"
     ) -> np.ndarray:
         """
         移动到目标位姿（使用IK求解和轨迹插值）
@@ -252,12 +253,13 @@ class UR5eController:
         Args:
             target_position: 目标位置 [x, y, z]
             target_orientation: 目标朝向四元数 [w, x, y, z]
+            approach_direction: 接近方向 "top" 或 "side_back/front/left/right"
 
         Returns:
             np.ndarray: 目标关节角度
         """
         # 使用IK求解目标关节角度
-        joint_pos = self._solve_ik(target_position, target_orientation)
+        joint_pos = self._solve_ik(target_position, target_orientation, approach_direction)
 
         # 启动插值运动
         self._start_joint_positions = self.get_joint_positions().copy()
@@ -266,42 +268,64 @@ class UR5eController:
 
         return joint_pos
 
+    def _get_orientation_for_direction(self, direction: str) -> np.ndarray:
+        """
+        根据接近方向计算末端执行器的四元数姿态
+
+        Args:
+            direction: "top", "side_back", "side_front", "side_left", "side_right"
+
+        Returns:
+            np.ndarray: 四元数 [w, x, y, z]
+        """
+        # 使用scipy进行旋转计算
+        if direction == "top":
+            # 末端朝下 (绕X轴旋转180度)
+            rot = R.from_euler('x', 180, degrees=True)
+        elif direction == "side_back":
+            # 末端朝+X方向 (绕Y轴旋转-90度)
+            rot = R.from_euler('y', -90, degrees=True)
+        elif direction == "side_front":
+            # 末端朝-X方向 (绕Y轴旋转90度)
+            rot = R.from_euler('y', 90, degrees=True)
+        elif direction == "side_left":
+            # 末端朝+Y方向 (绕X轴旋转90度)
+            rot = R.from_euler('x', 90, degrees=True)
+        elif direction == "side_right":
+            # 末端朝-Y方向 (绕X轴旋转-90度)
+            rot = R.from_euler('x', -90, degrees=True)
+        else:
+            # 默认朝下
+            rot = R.from_euler('x', 180, degrees=True)
+
+        # scipy返回 [x, y, z, w]，需要转换为 [w, x, y, z]
+        quat_xyzw = rot.as_quat()
+        quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
+        return quat_wxyz
+
     def _solve_ik(
         self,
         target_position: np.ndarray,
-        target_orientation: np.ndarray = None
+        target_orientation: np.ndarray = None,
+        approach_direction: str = "top"
     ) -> np.ndarray:
         """
         使用CuRobo求解无碰撞逆运动学
 
         Args:
             target_position: 目标位置 [x, y, z] (世界坐标)
-            target_orientation: 目标朝向四元数 [w, x, y, z]，默认末端朝下
+            target_orientation: 目标朝向四元数 [w, x, y, z]
+            approach_direction: 接近方向
 
         Returns:
             np.ndarray: 6个关节角度
         """
         print(f"[CuRobo IK] Target position (world): {target_position}")
+        print(f"[CuRobo IK] Approach direction: {approach_direction}")
 
-        # 默认末端朝下，保持当前rz不变
+        # 根据接近方向计算末端姿态
         if target_orientation is None:
-            # 获取当前末端姿态，提取rz
-            _, current_rot = self.get_end_effector_pose()
-            current_rz = current_rot.GetAxis()[2] * current_rot.GetAngle() * np.pi / 180.0
-
-            # 构造四元数: rx=180°, ry=0°, rz=当前值 (外旋XYZ)
-            rx, ry = np.pi, 0.0
-            # 四元数 = Rz * Ry * Rx (外旋等价于内旋逆序)
-            cx, sx = np.cos(rx/2), np.sin(rx/2)
-            cy, sy = np.cos(ry/2), np.sin(ry/2)
-            cz, sz = np.cos(current_rz/2), np.sin(current_rz/2)
-
-            # ZYX内旋顺序计算四元数 [w, x, y, z]
-            w = cx*cy*cz + sx*sy*sz
-            x = sx*cy*cz - cx*sy*sz
-            y = cx*sy*cz + sx*cy*sz
-            z = cx*cy*sz - sx*sy*cz
-            target_orientation = np.array([w, x, y, z])
+            target_orientation = self._get_orientation_for_direction(approach_direction)
 
         # 转换为相对于机器人基座的坐标
         rel_pos = target_position - np.array(self._base_position)
@@ -313,7 +337,7 @@ class UR5eController:
             quaternion=torch.tensor(np.array([target_orientation]), dtype=torch.float32, device=device)
         )
 
-        # 使用当前关节位置作为seed，让IK找到构型变化最小的解
+        # 使用当前关节位置作为seed
         current_joints = self.get_joint_positions()
         seed_config = torch.tensor(
             current_joints.reshape(1, 1, -1),
@@ -329,7 +353,7 @@ class UR5eController:
             print(f"[CuRobo IK] Solution found: {joint_positions}")
             return joint_positions
         else:
-            print("[CuRobo IK] Warning: No collision-free solution found, using best effort")
+            print("[CuRobo IK] Warning: No collision-free solution found")
             joint_positions = result.solution[0].cpu().numpy()
             return joint_positions
 

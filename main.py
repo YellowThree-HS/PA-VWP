@@ -38,16 +38,23 @@ class BoxPickSimulation:
         self.grasp_delay = 0  # 抓取延迟计数
         self.home_steps = 10  # UR5运动到直立姿态所需步数
         self.box_spawn_step = 20  # 生成箱子的时机
-        self.stable_steps = 300  # 箱子落地稳定所需步数（增加等待时间让10个箱子稳定）
+        self.stable_steps = 300  # 箱子落地稳定所需步数
 
         # 多箱子相关
         self.box_paths = []  # 所有纸箱路径
-        self.target_box_path = None  # 目标纸箱（最上面的）
+        self.target_box_path = None  # 目标纸箱
         self.target_box_size = None  # 目标纸箱尺寸
 
-        # 完成后计时器
-        self.done_timer = 0
-        self.shutdown_delay = 20 * 60  # 20秒 (假设60Hz仿真频率)
+        # 阶段控制 (S0->S1->S0->S2)
+        self.phase = 0  # 0=第一次抓取(稳定), 1=第二次抓取(不稳定)
+        self.hold_timer = 0  # 保持计时器
+        self.hold_duration_s1 = 5 * 60  # S1保持5秒 (60Hz)
+        self.hold_duration_s2 = 20 * 60  # S2保持20秒 (60Hz)
+        self.first_box_path = None  # 第一次抓取的箱子路径（用于排除）
+
+        # 抓取方向相关
+        self.grasp_direction = "top"  # "top" 或 "side_*"
+        self.grasp_info = None  # 抓取信息
 
     def _create_base(self, height: float = 0.15, radius: float = 0.1):
         """创建UR5基座"""
@@ -181,6 +188,80 @@ class BoxPickSimulation:
             return np.array([pos[0], pos[1], pos[2]])
         return None
 
+    def _calculate_pick_waypoints(self, box_pos: np.ndarray, box_height: float):
+        """根据抓取方向计算路径点"""
+        box_size = self.target_box_size
+
+        if self.grasp_direction == "top":
+            # 顶面抓取
+            box_top_z = box_pos[2] + box_height / 2
+            safe_height = 0.50
+            self.safe_pos = np.array([box_pos[0], box_pos[1], safe_height])
+            self.approach_pos = np.array([box_pos[0], box_pos[1], box_top_z + 0.10])
+            self.pick_pos = np.array([box_pos[0], box_pos[1], box_top_z + 0.02])
+            self.lift_pos = np.array([box_pos[0], box_pos[1], 0.40])
+        else:
+            # 侧面抓取
+            grasp_point = self.grasp_info["grasp_point"]
+            approach_vec = self.grasp_info["approach_vector"]
+
+            # 安全位置：在抓取点上方
+            self.safe_pos = np.array([grasp_point[0], grasp_point[1], 0.50])
+
+            # 接近位置：沿接近方向后退15cm
+            self.approach_pos = grasp_point - approach_vec * 0.15
+
+            # 抓取位置：距离侧面2cm
+            self.pick_pos = grasp_point - approach_vec * 0.02
+
+            # 提升位置：先后退再提升
+            self.lift_pos = np.array([
+                grasp_point[0] - approach_vec[0] * 0.10,
+                grasp_point[1] - approach_vec[1] * 0.10,
+                0.40
+            ])
+
+        print(f"Safe pos: {self.safe_pos}")
+        print(f"Approach pos: {self.approach_pos}")
+        print(f"Pick pos: {self.pick_pos}")
+        print(f"Lift pos: {self.lift_pos}")
+
+        # 移动到安全高度
+        self.ur5.move_to_pose(self.safe_pos, approach_direction=self.grasp_direction)
+
+    def _start_pick_sequence(self):
+        """开始抓取序列，根据phase选择目标箱子"""
+        if self.phase == 0:
+            # 第一阶段：抓取最顶上的箱子（稳定抓取）
+            topmost = self.box_gen.get_topmost_box()
+            if topmost is None:
+                print("Error: Cannot find any box")
+                return
+            self.target_box_path, box_pos, self.target_box_size = topmost
+            self.first_box_path = self.target_box_path
+            self.grasp_direction = "top"
+            self.grasp_info = None
+            print(f"=== S1: 选择最顶部箱子（稳定抓取）===")
+        else:
+            # 第二阶段：抓取边缘支撑箱子（不稳定抓取）
+            result = self.box_gen.get_unstable_graspable_box(
+                exclude_paths=[self.first_box_path] if self.first_box_path else None
+            )
+            if result is None:
+                print("Error: Cannot find unstable box")
+                return
+            self.target_box_path, box_pos, self.target_box_size, self.grasp_info = result
+            self.grasp_direction = self.grasp_info["direction"]
+            print(f"=== S2: 选择边缘支撑箱子（不稳定抓取）===")
+            print(f"抓取方向: {self.grasp_direction}")
+
+        box_height = self.target_box_size[2]
+        print(f"Target box: {self.target_box_path}")
+        print(f"Box position: {box_pos}, size: {self.target_box_size}")
+
+        # 根据抓取方向计算路径点
+        self._calculate_pick_waypoints(box_pos, box_height)
+
     def run(self):
         """运行仿真"""
         self.setup_scene()
@@ -223,28 +304,8 @@ class BoxPickSimulation:
 
                 # 箱子稳定后开始抓取
                 if self.step_count == self.stable_steps:
-                    # 找到最上面的纸箱
-                    topmost = self.box_gen.get_topmost_box()
-                    if topmost is None:
-                        print("Error: Cannot find any box")
-                        continue
-
-                    self.target_box_path, box_pos, self.target_box_size = topmost
-                    box_height = self.target_box_size[2]
-
-                    print(f"Found topmost box: {self.target_box_path}")
-                    print(f"Box position: {box_pos}, size: {self.target_box_size}")
-
-                    # 计算路径点（添加安全高度避障）
-                    box_top_z = box_pos[2] + box_height / 2
-                    safe_height = 0.50  # 安全高度
-                    self.safe_pos = np.array([box_pos[0], box_pos[1], safe_height])
-                    self.approach_pos = np.array([box_pos[0], box_pos[1], box_top_z + 0.10])
-                    self.pick_pos = np.array([box_pos[0], box_pos[1], box_top_z + 0.02])
-                    self.lift_pos = np.array([box_pos[0], box_pos[1], 0.40])  # 提升到40cm高度
-
-                    print(f"Step 4: Moving to safe height {self.safe_pos}")
-                    self.ur5.move_to_pose(self.safe_pos)
+                    print("=== S0: 环境已稳定 ===")
+                    self._start_pick_sequence()
                     self.state = "SAFE_HEIGHT"
 
             elif self.state == "SAFE_HEIGHT" and self.ur5.is_motion_complete():
@@ -252,7 +313,7 @@ class BoxPickSimulation:
                 if ee_pos is not None:
                     print(f"Reached safe height. EE position: {ee_pos}")
                 print(f"Step 5: Approaching box at {self.approach_pos}")
-                self.ur5.move_to_pose(self.approach_pos)
+                self.ur5.move_to_pose(self.approach_pos, approach_direction=self.grasp_direction)
                 self.state = "APPROACH"
 
             elif self.state == "APPROACH" and self.ur5.is_motion_complete():
@@ -260,7 +321,7 @@ class BoxPickSimulation:
                 if ee_pos is not None:
                     print(f"Reached approach. EE position: {ee_pos}")
                 print(f"Step 6: Moving to pick position {self.pick_pos}")
-                self.ur5.move_to_pose(self.pick_pos)
+                self.ur5.move_to_pose(self.pick_pos, approach_direction=self.grasp_direction)
                 self.state = "PICK"
 
             elif self.state == "PICK" and self.ur5.is_motion_complete():
@@ -268,9 +329,10 @@ class BoxPickSimulation:
                 print(f"=== PICK位置对比 ===")
                 print(f"目标位置: {self.pick_pos}")
                 print(f"实际EE位置: {ee_pos}")
+                print(f"抓取方向: {self.grasp_direction}")
                 print(f"====================")
                 print("Step 7: Activating suction gripper")
-                self.gripper.activate(self.target_box_path)
+                self.gripper.activate(self.target_box_path, self.grasp_direction)
                 self.state = "GRASP"
                 self.grasp_delay = 0
 
@@ -278,19 +340,45 @@ class BoxPickSimulation:
                 self.grasp_delay += 1
                 if self.grasp_delay > 30:
                     print("Step 8: Lifting box")
-                    self.ur5.move_to_pose(self.lift_pos)
+                    self.ur5.move_to_pose(self.lift_pos, approach_direction="top")
                     self.state = "LIFT"
 
             elif self.state == "LIFT" and self.ur5.is_motion_complete():
-                self.state = "DONE"
-                print("Task complete! Box lifted successfully.")
-                print("Simulation will close in 20 seconds...")
+                self.state = "HOLD"
+                self.hold_timer = 0
+                if self.phase == 0:
+                    print("=== S1: 稳定抓取完成，保持5秒 ===")
+                else:
+                    print("=== S2: 不稳定抓取完成，保持20秒观察倒塌 ===")
+
+            elif self.state == "HOLD":
+                self.hold_timer += 1
+                duration = self.hold_duration_s1 if self.phase == 0 else self.hold_duration_s2
+
+                if self.hold_timer >= duration:
+                    if self.phase == 0:
+                        # 第一阶段完成，放回箱子
+                        print("5秒保持完成，释放箱子并回到S0...")
+                        self.gripper.deactivate()
+                        self.state = "RELEASE_WAIT"
+                        self.hold_timer = 0
+                    else:
+                        # 第二阶段完成，结束仿真
+                        print("20秒保持完成，仿真结束")
+                        self.state = "DONE"
+
+            elif self.state == "RELEASE_WAIT":
+                self.hold_timer += 1
+                # 等待箱子落下稳定
+                if self.hold_timer >= 180:  # 等待3秒
+                    print("=== 回到S0，准备第二次抓取 ===")
+                    self.phase = 1
+                    self._start_pick_sequence()
+                    self.state = "SAFE_HEIGHT"
 
             elif self.state == "DONE":
-                self.done_timer += 1
-                if self.done_timer >= self.shutdown_delay:
-                    print("20 seconds elapsed. Closing simulation...")
-                    break
+                print("仿真完成，关闭...")
+                break
 
         simulation_app.close()
 
