@@ -1,0 +1,27 @@
+# UR5机器人配置文件
+robot:
+  name: "ur5"
+  usd_path: "/Isaac/Robots/UniversalRobots/ur5/ur5.usd"
+  position: [0.0, 0.0, 0.0]
+  orientation: [1.0, 0.0, 0.0, 0.0]  # wxyz四元数
+
+# 吸盘配置
+suction_gripper:
+  name: "suction_gripper"
+  parent_link: "tool0"
+  offset: [0.0, 0.0, 0.1]  # 相对于tool0的偏移
+  suction_force: 50.0  # 吸力大小(N)
+
+# 纸箱配置
+box:
+  size: [0.3, 0.2, 0.15]  # 长宽高(m)
+  mass: 1.0  # 质量(kg)
+  position: [0.5, 0.0, 0.075]  # 初始位置
+  color: [0.6, 0.4, 0.2, 1.0]  # RGBA颜色
+
+# 运动规划配置
+motion:
+  pick_height: 0.3  # 抓取高度
+  lift_height: 0.5  # 提升高度
+  approach_speed: 0.1  # 接近速度
+  lift_speed: 0.05  # 提升速度

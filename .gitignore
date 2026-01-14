@@ -1,0 +1,29 @@
+# 排除 curobo 文件夹（嵌入的 git 仓库）
+curobo/
+
+# Windows 特殊文件
+nul
+NUL
+
+# Python 相关
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 其他
+.DS_Store
+*.log
