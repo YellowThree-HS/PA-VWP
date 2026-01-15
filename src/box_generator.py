@@ -5,7 +5,7 @@
 """
 
 import numpy as np
-from pxr import UsdGeom, UsdPhysics, Gf
+from pxr import UsdGeom, UsdPhysics, Gf, Semantics, UsdShade, Sdf, PhysxSchema
 import omni.usd
 
 
@@ -63,8 +63,26 @@ class BoxGenerator:
         # 设置缩放以匹配尺寸
         cube.AddScaleOp().Set(Gf.Vec3f(*size))
 
+        # 创建粗糙纸箱材质
+        mat_path = f"{prim_path}/material"
+        material = UsdShade.Material.Define(stage, mat_path)
+        shader = UsdShade.Shader.Define(stage, f"{mat_path}/shader")
+        shader.CreateIdAttr("UsdPreviewSurface")
+
         # 设置颜色
-        cube.GetDisplayColorAttr().Set([Gf.Vec3f(color[0], color[1], color[2])])
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+            Gf.Vec3f(color[0], color[1], color[2])
+        )
+        # 设置粗糙度（0.8-1.0 很粗糙）
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.9)
+        # 设置金属度（纸箱不是金属）
+        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+
+        # 连接shader到material
+        material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+
+        # 绑定材质到几何体
+        UsdShade.MaterialBindingAPI(cube.GetPrim()).Bind(material)
 
         # 添加刚体物理
         rigid_body = UsdPhysics.RigidBodyAPI.Apply(xform.GetPrim())
@@ -73,9 +91,33 @@ class BoxGenerator:
         # 添加碰撞
         collision = UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
 
+        # 添加物理材质 - 高摩擦、低弹性，防止箱子弹开
+        phys_mat_path = f"{prim_path}/physics_material"
+        phys_mat_prim = stage.DefinePrim(phys_mat_path)
+        phys_mat = UsdPhysics.MaterialAPI.Apply(phys_mat_prim)
+        phys_mat.CreateStaticFrictionAttr(0.8)   # 静摩擦
+        phys_mat.CreateDynamicFrictionAttr(0.6)  # 动摩擦
+        phys_mat.CreateRestitutionAttr(0.01)     # 极低弹性，几乎不反弹
+
+        # 使用PhysxSchema绑定物理材质到碰撞体
+        physx_collision = PhysxSchema.PhysxCollisionAPI.Apply(cube.GetPrim())
+        collision_prim = cube.GetPrim()
+        rel = collision_prim.CreateRelationship("material:binding:physics", False)
+        rel.SetTargets([Sdf.Path(phys_mat_path)])
+
+        # 添加刚体阻尼 - 减缓运动，让箱子更快稳定
+        physx_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(xform.GetPrim())
+        physx_rb.CreateLinearDampingAttr(0.5)    # 线性阻尼
+        physx_rb.CreateAngularDampingAttr(0.5)   # 角阻尼
+
         # 设置质量
         mass_api = UsdPhysics.MassAPI.Apply(xform.GetPrim())
         mass_api.CreateMassAttr(mass)
+
+        # 添加语义标签用于实例分割
+        sem = Semantics.SemanticsAPI.Apply(xform.GetPrim(), "Semantics")
+        sem.CreateSemanticTypeAttr().Set("class")
+        sem.CreateSemanticDataAttr().Set("box")
 
         # 保存纸箱信息
         self._boxes[name] = {
@@ -119,7 +161,7 @@ class BoxGenerator:
         count: int = 10,
         center: list = None,
         spread: float = 0.3,
-        drop_height: float = 0.5,
+        drop_height: float = 0.2,
         size_range: tuple = ((0.08, 0.15), (0.06, 0.12), (0.05, 0.10)),
         mass_range: tuple = (0.5, 2.0)
     ) -> list:
@@ -141,12 +183,8 @@ class BoxGenerator:
             center = [0.4, 0.0]
 
         box_paths = []
-        colors = [
-            [0.6, 0.4, 0.2, 1.0],   # 棕色
-            [0.7, 0.5, 0.3, 1.0],   # 浅棕色
-            [0.5, 0.35, 0.2, 1.0],  # 深棕色
-            [0.65, 0.45, 0.25, 1.0], # 中棕色
-        ]
+        # 记录本批次已生成箱子的位置和尺寸，用于碰撞检测
+        spawned_boxes = []
 
         for i in range(count):
             # 随机尺寸
@@ -156,20 +194,65 @@ class BoxGenerator:
                 np.random.uniform(size_range[2][0], size_range[2][1])
             ]
 
-            # 随机位置（在中心点周围散布，高度递增避免初始碰撞）
-            pos_x = center[0] + np.random.uniform(-spread, spread)
-            pos_y = center[1] + np.random.uniform(-spread, spread)
-            pos_z = drop_height + i * 0.05 + size[2] / 2  # 递增高度（每个+5cm）
+            # 尝试找到不重叠的位置
+            max_attempts = 50
+            pos_x, pos_y, pos_z = None, None, None
+
+            for attempt in range(max_attempts):
+                # 随机位置（在中心点周围散布）
+                trial_x = center[0] + np.random.uniform(-spread, spread)
+                trial_y = center[1] + np.random.uniform(-spread, spread)
+                # 高度根据已生成箱子数量递增，确保足够间距
+                layer = len(spawned_boxes) // 5
+                trial_z = drop_height + layer * 0.20 + size[2] / 2  # 层间距增加到20cm
+
+                # 检查与已生成箱子是否重叠
+                overlap = False
+                for other_pos, other_size in spawned_boxes:
+                    # 计算两个箱子在各轴上的距离
+                    dx = abs(trial_x - other_pos[0])
+                    dy = abs(trial_y - other_pos[1])
+                    dz = abs(trial_z - other_pos[2])
+
+                    # 计算最小安全距离（两个箱子半尺寸之和 + 小间隙）
+                    min_dx = (size[0] + other_size[0]) / 2 + 0.01
+                    min_dy = (size[1] + other_size[1]) / 2 + 0.01
+                    min_dz = (size[2] + other_size[2]) / 2 + 0.01
+
+                    # 如果三个轴都重叠，则箱子重叠
+                    if dx < min_dx and dy < min_dy and dz < min_dz:
+                        overlap = True
+                        break
+
+                if not overlap:
+                    pos_x, pos_y, pos_z = trial_x, trial_y, trial_z
+                    break
+
+            # 如果找不到不重叠的位置，放到更高的层
+            if pos_x is None:
+                pos_x = center[0] + np.random.uniform(-spread, spread)
+                pos_y = center[1] + np.random.uniform(-spread, spread)
+                pos_z = drop_height + (len(spawned_boxes) // 3 + 1) * 0.25 + size[2] / 2
 
             # 随机质量
             mass = np.random.uniform(mass_range[0], mass_range[1])
 
-            # 随机颜色
-            color = colors[i % len(colors)]
+            # 记录本箱子位置和尺寸
+            spawned_boxes.append(([pos_x, pos_y, pos_z], size))
 
-            # 创建纸箱
+            # 随机纸箱颜色（黄褐色范围，更接近真实纸箱）
+            # 基础色调：黄褐色 (0.72, 0.53, 0.35)
+            base_r, base_g, base_b = 0.72, 0.53, 0.35
+            variation = 0.05  # 颜色波动范围
+            color = [
+                base_r + np.random.uniform(-variation, variation),
+                base_g + np.random.uniform(-variation, variation),
+                base_b + np.random.uniform(-variation, variation),
+                1.0
+            ]
+
+            # 创建纸箱（不传name，让create_box自动生成唯一名字）
             path = self.create_box(
-                name=f"box_{i}",
                 position=[pos_x, pos_y, pos_z],
                 size=size,
                 mass=mass,
@@ -399,3 +482,181 @@ class BoxGenerator:
                 }
                 return (box["prim_path"], box["pos"], box["size"], grasp_info)
         return None
+
+    def get_random_box(self, exclude_paths: list = None) -> tuple:
+        """
+        随机选择一个纸箱
+
+        Args:
+            exclude_paths: 要排除的箱子路径列表
+
+        Returns:
+            tuple: (name, prim_path, position) 或 None
+        """
+        if not self._boxes:
+            return None
+
+        if exclude_paths is None:
+            exclude_paths = []
+
+        # 过滤可用的箱子
+        available = [
+            (name, info) for name, info in self._boxes.items()
+            if info["prim_path"] not in exclude_paths
+        ]
+
+        if not available:
+            return None
+
+        # 随机选择
+        name, info = available[np.random.randint(len(available))]
+        pos = self.get_box_position(name)
+
+        return (name, info["prim_path"], pos)
+
+    def delete_box(self, prim_path: str) -> bool:
+        """
+        从场景中删除指定纸箱
+
+        Args:
+            prim_path: 纸箱的prim路径
+
+        Returns:
+            bool: 是否成功删除
+        """
+        stage = omni.usd.get_context().get_stage()
+        prim = stage.GetPrimAtPath(prim_path)
+
+        if not prim.IsValid():
+            print(f"Invalid prim path: {prim_path}")
+            return False
+
+        # 从stage中删除prim
+        stage.RemovePrim(prim_path)
+        print(f"Deleted box: {prim_path}")
+
+        # 从跟踪列表中移除
+        for name, info in list(self._boxes.items()):
+            if info["prim_path"] == prim_path:
+                del self._boxes[name]
+                break
+
+        return True
+
+    def remove_box_from_tracking(self, name: str):
+        """从跟踪列表中移除箱子（不删除物理对象）"""
+        if name in self._boxes:
+            del self._boxes[name]
+            print(f"Box {name} removed from tracking")
+
+    def get_all_box_positions(self, exclude_paths: list = None) -> dict:
+        """
+        获取所有箱子的当前位置快照
+
+        Args:
+            exclude_paths: 要排除的箱子路径列表
+
+        Returns:
+            dict: {prim_path: position_array}
+        """
+        if exclude_paths is None:
+            exclude_paths = []
+
+        positions = {}
+        stage = omni.usd.get_context().get_stage()
+
+        for name, info in self._boxes.items():
+            if info["prim_path"] in exclude_paths:
+                continue
+            prim = stage.GetPrimAtPath(info["prim_path"])
+            if prim.IsValid():
+                xformable = UsdGeom.Xformable(prim)
+                transform = xformable.ComputeLocalToWorldTransform(0)
+                pos = transform.ExtractTranslation()
+                positions[info["prim_path"]] = np.array([pos[0], pos[1], pos[2]])
+
+        return positions
+
+    def save_scene_state(self) -> dict:
+        """
+        保存当前场景中所有箱子的状态（位置、旋转）
+
+        Returns:
+            dict: 场景状态快照
+        """
+        state = {}
+        stage = omni.usd.get_context().get_stage()
+
+        for name, info in self._boxes.items():
+            prim = stage.GetPrimAtPath(info["prim_path"])
+            if prim.IsValid():
+                xformable = UsdGeom.Xformable(prim)
+                transform = xformable.ComputeLocalToWorldTransform(0)
+                pos = transform.ExtractTranslation()
+                # 提取旋转四元数
+                rot_matrix = transform.ExtractRotationMatrix()
+                quat = rot_matrix.ExtractRotation().GetQuaternion()
+
+                state[name] = {
+                    "prim_path": info["prim_path"],
+                    "position": [pos[0], pos[1], pos[2]],
+                    "quaternion": [quat.GetReal(), quat.GetImaginary()[0],
+                                   quat.GetImaginary()[1], quat.GetImaginary()[2]],
+                    "size": info["size"],
+                    "mass": info["mass"]
+                }
+
+        print(f"Saved scene state: {len(state)} boxes")
+        return state
+
+    def restore_scene_state(self, state: dict):
+        """
+        恢复场景到保存的状态
+
+        Args:
+            state: 之前保存的场景状态
+        """
+        stage = omni.usd.get_context().get_stage()
+
+        for name, box_state in state.items():
+            prim_path = box_state["prim_path"]
+            prim = stage.GetPrimAtPath(prim_path)
+
+            if not prim.IsValid():
+                # 箱子被删除了，需要重新创建
+                self._recreate_box(name, box_state)
+            else:
+                # 箱子存在，恢复位置
+                self._reset_box_transform(prim, box_state)
+
+        print(f"Restored scene state: {len(state)} boxes")
+
+    def _recreate_box(self, name: str, box_state: dict):
+        """重新创建被删除的箱子"""
+        # 使用保存的参数重新创建
+        self.create_box(
+            name=name,
+            position=box_state["position"],
+            size=box_state["size"],
+            mass=box_state["mass"]
+        )
+
+    def _reset_box_transform(self, prim, box_state: dict):
+        """重置箱子的位置、旋转和速度"""
+        xformable = UsdGeom.Xformable(prim)
+
+        # 清除现有变换操作
+        xformable.ClearXformOpOrder()
+
+        # 恢复位置
+        xformable.AddTranslateOp().Set(Gf.Vec3d(*box_state["position"]))
+
+        # 恢复旋转（使用四元数）
+        quat = box_state["quaternion"]
+        xformable.AddOrientOp().Set(Gf.Quatf(quat[0], quat[1], quat[2], quat[3]))
+
+        # 重置刚体速度为0
+        rigid_body = UsdPhysics.RigidBodyAPI(prim)
+        if rigid_body:
+            rigid_body.GetVelocityAttr().Set(Gf.Vec3f(0, 0, 0))
+            rigid_body.GetAngularVelocityAttr().Set(Gf.Vec3f(0, 0, 0))

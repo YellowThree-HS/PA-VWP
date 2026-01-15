@@ -1,6 +1,6 @@
 """
 BoxWorld MVP - 主仿真脚本
-UR5机器人使用吸盘抓取纸箱
+纸箱堆叠稳定性测试
 适配Isaac Sim 5.1版本
 """
 
@@ -11,125 +11,84 @@ simulation_app = SimulationApp({"headless": False})
 
 import numpy as np
 from isaacsim.core.api import World
-from pxr import UsdGeom, UsdPhysics, Gf
+from pxr import UsdGeom, UsdPhysics, Gf, Sdf
 import omni.usd
+import omni.replicator.core as rep
 
 # 导入自定义模块
 import sys
 sys.path.append("src")
-from ur5_controller import UR5eController
-from suction_gripper import SuctionGripper
 from box_generator import BoxGenerator
 
 
 class BoxPickSimulation:
-    """纸箱抓取仿真"""
+    """纸箱堆叠稳定性测试仿真"""
 
     def __init__(self):
         self.world = None
-        self.ur5 = None
-        self.gripper = None
         self.box_gen = None
-        self.box_prim_path = None
 
         # 状态机
         self.state = "INIT"
         self.step_count = 0
-        self.grasp_delay = 0  # 抓取延迟计数
-        self.home_steps = 10  # UR5运动到直立姿态所需步数
-        self.box_spawn_step = 20  # 生成箱子的时机
-        self.stable_steps = 300  # 箱子落地稳定所需步数
+        self.box_spawn_step = 20  # 第一批箱子的时机
+        self.box_spawn_step_2 = 80  # 第二批箱子（1秒后，60步）
+        self.box_spawn_step_3 = 140  # 第三批箱子（再1秒后）
+        self.hold_duration = 5 * 60  # 保持5秒 (60Hz)
+        self.hold_timer = 0
 
         # 多箱子相关
         self.box_paths = []  # 所有纸箱路径
-        self.target_box_path = None  # 目标纸箱
-        self.target_box_size = None  # 目标纸箱尺寸
 
-        # 阶段控制 (S0->S1->S0->S2)
-        self.phase = 0  # 0=第一次抓取(稳定), 1=第二次抓取(不稳定)
-        self.hold_timer = 0  # 保持计时器
-        self.hold_duration_s1 = 5 * 60  # S1保持5秒 (60Hz)
-        self.hold_duration_s2 = 20 * 60  # S2保持20秒 (60Hz)
-        self.first_box_path = None  # 第一次抓取的箱子路径（用于排除）
+        # 箱子移除相关
+        self.removed_box_path = None  # 被移除的箱子路径
+        self.removal_force_applied = False  # 是否已施加移除力
+        self.post_removal_wait = 30  # 移除后等待时间（0.5秒）
+        self.post_removal_timer = 0
 
-        # 抓取方向相关
-        self.grasp_direction = "top"  # "top" 或 "side_*"
-        self.grasp_info = None  # 抓取信息
+        # 稳定性检测相关
+        self.positions_before_removal = {}  # 移除前的位置快照
+        self.stability_threshold = 0.02  # 位置变化阈值（2cm）
 
-    def _create_base(self, height: float = 0.15, radius: float = 0.1):
-        """创建UR5基座"""
+        # 循环测试相关
+        self.initial_scene_state = None  # 初始场景状态
+        self.test_iteration = 0  # 当前测试轮次
+        self.visible_boxes_to_test = []  # 待测试的可见箱子列表
+        self.total_boxes_to_test = 0  # 总共要测试的箱子数
+        self.test_results = []  # 测试结果记录
+
+        # 初始图像数据（只保存一次）
+        self.initial_rgb_image = None
+        self.initial_mask_data = None
+        self.initial_id_to_labels = None
+
+        # Replicator相关
+        self.render_product = None
+        self.rgb_annotator = None
+        self.seg_annotator = None
+
+    def _create_cameras(self):
+        """创建顶部深度相机"""
         stage = omni.usd.get_context().get_stage()
 
-        # 创建圆柱体基座
-        base_path = "/World/UR5_Base"
-        cylinder = UsdGeom.Cylinder.Define(stage, base_path)
-        cylinder.GetRadiusAttr().Set(radius)
-        cylinder.GetHeightAttr().Set(height)
-        cylinder.GetAxisAttr().Set("Z")
+        # 顶部相机 - 俯视箱子堆
+        top_cam_path = "/World/TopCamera"
+        top_cam = UsdGeom.Camera.Define(stage, top_cam_path)
+        top_xform = UsdGeom.Xformable(top_cam.GetPrim())
+        # 位置：箱子堆上方1.5m
+        top_xform.AddTranslateOp().Set(Gf.Vec3d(0.45, 0.0, 1.5))
+        # 旋转：(0, 0, 180) 向下看
+        top_xform.AddRotateXYZOp().Set(Gf.Vec3f(0, 0, 180))
+        top_cam.GetFocalLengthAttr().Set(18.0)
 
-        # 设置位置（圆柱体中心在height/2处）
-        xform = UsdGeom.Xformable(cylinder.GetPrim())
-        xform.AddTranslateOp().Set(Gf.Vec3d(0, 0, height / 2))
+        # 设置Replicator获取RGB和实例分割掩码
+        self.render_product = rep.create.render_product(top_cam_path, (640, 480))
+        self.rgb_annotator = rep.AnnotatorRegistry.get_annotator("rgb")
+        self.rgb_annotator.attach([self.render_product])
+        self.seg_annotator = rep.AnnotatorRegistry.get_annotator("instance_segmentation")
+        self.seg_annotator.attach([self.render_product])
 
-        # 设置颜色（深灰色）
-        cylinder.GetDisplayColorAttr().Set([(0.3, 0.3, 0.3)])
-
-        # 添加碰撞
-        UsdPhysics.CollisionAPI.Apply(cylinder.GetPrim())
-
-    def _create_fence(self, center: list = None, width: float = 0.4, depth: float = 0.3, height: float = 0.2):
-        """
-        创建三面围栏，让箱子聚集在机械臂前方
-
-        Args:
-            center: 围栏中心位置 [x, y]
-            width: 围栏宽度（左右方向）
-            depth: 围栏深度（前后方向）
-            height: 围栏高度
-        """
-        if center is None:
-            center = [0.4, 0.0]
-
-        stage = omni.usd.get_context().get_stage()
-        wall_thickness = 0.02  # 墙壁厚度
-
-        # 后墙（远离机械臂的一侧）
-        back_path = "/World/Fence/BackWall"
-        back_xform = UsdGeom.Xform.Define(stage, back_path)
-        back_pos = [center[0] + depth / 2 + wall_thickness / 2, center[1], height / 2]
-        back_xform.AddTranslateOp().Set(Gf.Vec3d(*back_pos))
-
-        back_cube = UsdGeom.Cube.Define(stage, f"{back_path}/geometry")
-        back_cube.GetSizeAttr().Set(1.0)
-        back_cube.AddScaleOp().Set(Gf.Vec3f(wall_thickness, width, height))
-        back_cube.GetDisplayColorAttr().Set([Gf.Vec3f(0.5, 0.5, 0.5)])
-        UsdPhysics.CollisionAPI.Apply(back_cube.GetPrim())
-
-        # 左墙
-        left_path = "/World/Fence/LeftWall"
-        left_xform = UsdGeom.Xform.Define(stage, left_path)
-        left_pos = [center[0], center[1] - width / 2 - wall_thickness / 2, height / 2]
-        left_xform.AddTranslateOp().Set(Gf.Vec3d(*left_pos))
-
-        left_cube = UsdGeom.Cube.Define(stage, f"{left_path}/geometry")
-        left_cube.GetSizeAttr().Set(1.0)
-        left_cube.AddScaleOp().Set(Gf.Vec3f(depth, wall_thickness, height))
-        left_cube.GetDisplayColorAttr().Set([Gf.Vec3f(0.5, 0.5, 0.5)])
-        UsdPhysics.CollisionAPI.Apply(left_cube.GetPrim())
-
-        # 右墙
-        right_path = "/World/Fence/RightWall"
-        right_xform = UsdGeom.Xform.Define(stage, right_path)
-        right_pos = [center[0], center[1] + width / 2 + wall_thickness / 2, height / 2]
-        right_xform.AddTranslateOp().Set(Gf.Vec3d(*right_pos))
-
-        right_cube = UsdGeom.Cube.Define(stage, f"{right_path}/geometry")
-        right_cube.GetSizeAttr().Set(1.0)
-        right_cube.AddScaleOp().Set(Gf.Vec3f(depth, wall_thickness, height))
-        right_cube.GetDisplayColorAttr().Set([Gf.Vec3f(0.5, 0.5, 0.5)])
-        UsdPhysics.CollisionAPI.Apply(right_cube.GetPrim())
-
-        print(f"Fence created at center {center}, size {width}x{depth}x{height}m")
+        print("Camera created: TopCamera (1.5m height, looking down)")
 
     def setup_scene(self):
         """设置仿真场景（不含箱子，箱子稍后动态生成）"""
@@ -137,130 +96,277 @@ class BoxPickSimulation:
         self.world = World(stage_units_in_meters=1.0)
         self.world.scene.add_default_ground_plane()
 
-        # 创建UR5基座 (15cm高)
-        self._create_base(height=0.15, radius=0.1)
-
-        # 创建三面围栏（让箱子聚集）
-        self._create_fence(center=[0.45, 0.0], width=0.6, depth=0.5, height=0.25)
-
-        # 加载UR5e机器人（放在基座上方）
-        self.ur5 = UR5eController("ur5e")
-        self.ur5.load_robot(
-            prim_path="/World/UR5",
-            position=[0.0, 0.0, 0.15]  # 基座高度
-        )
-
-        # 创建吸盘 (使用Isaac Sim SurfaceGripper)
-        self.gripper = SuctionGripper(
-            name="suction",
-            parent_prim_path="/World/UR5/tool0",
-            grip_threshold=0.03,  # 3cm内才能吸附（保留1cm余量）
-            force_limit=1000.0,
-            torque_limit=1000.0
-        )
-
         # 初始化箱子生成器（稍后动态生成箱子）
         self.box_gen = BoxGenerator()
 
+        # 创建深度相机
+        self._create_cameras()
+
         print("Scene setup complete (without box)!")
 
-    def spawn_box(self):
-        """生成50个随机大小的纸箱从半空中掉落"""
-        # 在围栏范围内生成纸箱（围栏宽0.6m，深0.5m）
-        self.box_paths = self.box_gen.create_random_boxes(
-            count=30,
-            center=[0.45, 0.0],  # 围栏中心
-            spread=0.20,  # 扩大散布范围
+    def spawn_box(self, batch: int = 1):
+        """分批生成随机大小的纸箱从半空中掉落，共100个
+
+        Args:
+            batch: 第几批 (1, 2, 3)
+        """
+        # 每批数量：34 + 33 + 33 = 100
+        batch_counts = {1: 34, 2: 33, 3: 33}
+        count = batch_counts.get(batch, 34)
+
+        # 箱子尺寸：确保不太扁，每个维度都在5-15cm之间
+        # 这样任意一个面都能被吸盘吸住
+        paths = self.box_gen.create_random_boxes(
+            count=count,
+            center=[0.45, 0.0],
+            spread=0.15,  # 稍微增大散布范围
             drop_height=0.30,  # 从30cm高度开始掉落
-            size_range=((0.05, 0.18), (0.04, 0.15), (0.03, 0.12)),  # 随机大小，上限增大
-            mass_range=(0.3, 2.0)
+            size_range=((0.06, 0.12), (0.06, 0.12), (0.06, 0.12)),
+            mass_range=(0.3, 1.5)
         )
-        print(f"Spawned {len(self.box_paths)} boxes into the fence")
+        self.box_paths.extend(paths)
+        print(f"Batch {batch}: Spawned {count} boxes, total: {len(self.box_paths)}")
 
-    def get_box_position(self):
-        """获取箱子当前位置"""
-        stage = omni.usd.get_context().get_stage()
-        box_prim = stage.GetPrimAtPath(self.box_prim_path)
-        if box_prim.IsValid():
-            xformable = UsdGeom.Xformable(box_prim)
-            transform = xformable.ComputeLocalToWorldTransform(0)
-            pos = transform.ExtractTranslation()
-            return np.array([pos[0], pos[1], pos[2]])
-        return None
+    def capture_initial_state(self):
+        """捕获并保存初始RGB图像和掩码数据"""
+        import cv2
+        import os
+        from datetime import datetime
 
-    def _calculate_pick_waypoints(self, box_pos: np.ndarray, box_height: float):
-        """根据抓取方向计算路径点"""
-        box_size = self.target_box_size
+        os.makedirs("result", exist_ok=True)
 
-        if self.grasp_direction == "top":
-            # 顶面抓取
-            box_top_z = box_pos[2] + box_height / 2
-            safe_height = 0.50
-            self.safe_pos = np.array([box_pos[0], box_pos[1], safe_height])
-            self.approach_pos = np.array([box_pos[0], box_pos[1], box_top_z + 0.10])
-            self.pick_pos = np.array([box_pos[0], box_pos[1], box_top_z + 0.02])
-            self.lift_pos = np.array([box_pos[0], box_pos[1], 0.40])
+        # 获取RGB图像
+        rgb_data = self.rgb_annotator.get_data()
+        if rgb_data is not None:
+            self.initial_rgb_image = rgb_data[:, :, :3].copy()
+            # 保存一张初始RGB
+            rgb_bgr = cv2.cvtColor(self.initial_rgb_image, cv2.COLOR_RGB2BGR)
+            cv2.imwrite("result/initial_rgb.png", rgb_bgr)
+            print("Initial RGB saved to result/initial_rgb.png")
+
+        # 获取分割掩码
+        seg_data = self.seg_annotator.get_data()
+        if seg_data is not None:
+            self.initial_mask_data = seg_data["data"].copy()
+            self.initial_id_to_labels = seg_data.get("info", {}).get("idToLabels", {})
+
+    def get_all_visible_boxes(self, min_visible_ratio: float = 0.20) -> list:
+        """获取所有在掩码中可见的箱子列表，过滤掉遮挡太多的
+
+        Args:
+            min_visible_ratio: 最小可见比例，低于此值的箱子会被跳过
+        """
+        seg_data = self.seg_annotator.get_data()
+        if seg_data is None:
+            print("[DEBUG] seg_data is None!")
+            return []
+
+        id_to_labels = seg_data.get("info", {}).get("idToLabels", {})
+        mask = seg_data["data"]
+        unique_ids = np.unique(mask)
+
+        # 先找出所有有效箱子的uid和像素数
+        box_pixels = {}
+        for uid in unique_ids:
+            if uid == 0:
+                continue
+            label_info = id_to_labels.get(str(uid), "")
+            label_str = str(label_info)
+            # 检查是否是箱子（路径包含/World/box_）
+            if "/World/box_" in label_str:
+                box_pixels[uid] = np.sum(mask == uid)
+
+        if not box_pixels:
+            print("[DEBUG] No box pixels found!")
+            return []
+
+        # 用箱子中最大像素数作为参考
+        max_pixels = max(box_pixels.values())
+        print(f"[DEBUG] 箱子像素范围: {min(box_pixels.values())} - {max_pixels}")
+
+        visible_boxes = []
+        skipped_count = 0
+
+        added_names = set()  # 防止重复添加
+        for uid, pixel_count in box_pixels.items():
+            visible_ratio = pixel_count / max_pixels
+
+            if visible_ratio < min_visible_ratio:
+                skipped_count += 1
+                continue
+
+            label_info = id_to_labels.get(str(uid), {})
+            label_str = str(label_info)
+
+            for name, info in self.box_gen.boxes.items():
+                # 精确匹配路径，避免 box_1 匹配到 box_10, box_11 等
+                if info["prim_path"] == label_str and name not in added_names:
+                    visible_boxes.append((name, info["prim_path"]))
+                    added_names.add(name)
+                    break
+
+        if skipped_count > 0:
+            print(f"跳过 {skipped_count} 个遮挡过多的箱子（可见比例 < {min_visible_ratio*100:.0f}%）")
+
+        print(f"可见箱子数量: {len(visible_boxes)}")
+        return visible_boxes
+
+    def save_annotated_result(self, iteration: int, removed_path: str, affected_boxes: list):
+        """保存标注结果图：消失箱子(绿色)、受影响箱子(红色)"""
+        import cv2
+
+        if self.initial_rgb_image is None or self.initial_mask_data is None:
+            print("No initial data available")
+            return
+
+        # 转换为BGR
+        rgb_bgr = cv2.cvtColor(self.initial_rgb_image, cv2.COLOR_RGB2BGR)
+
+        # 创建半透明叠加层
+        overlay = rgb_bgr.copy()
+        alpha = 0.4
+
+        # 找到被移除箱子的mask id
+        removed_id = None
+        for uid, label_info in self.initial_id_to_labels.items():
+            if removed_path in str(label_info):
+                removed_id = int(uid)
+                break
+
+        # 被移除的箱子标绿色
+        if removed_id is not None:
+            removed_mask = self.initial_mask_data == removed_id
+            overlay[removed_mask] = [0, 255, 0]  # BGR绿色
+
+        # 受影响的箱子标红色
+        for box_info in affected_boxes:
+            box_path = box_info["path"]
+            for uid, label_info in self.initial_id_to_labels.items():
+                if box_path in str(label_info):
+                    affected_mask = self.initial_mask_data == int(uid)
+                    overlay[affected_mask] = [0, 0, 255]  # BGR红色
+                    break
+
+        # 混合
+        result = cv2.addWeighted(rgb_bgr, alpha, overlay, 1 - alpha, 0)
+
+        # 保存
+        removed_name = removed_path.split("/")[-1]
+        save_path = f"result/iter{iteration:02d}_{removed_name}.png"
+        cv2.imwrite(save_path, result)
+        print(f"Annotated result saved to {save_path}")
+
+    def select_next_box_for_removal(self):
+        """从待测试列表中选择下一个箱子"""
+        if not self.visible_boxes_to_test:
+            return False
+
+        name, prim_path = self.visible_boxes_to_test.pop(0)
+        pos = self.box_gen.get_box_position(name)
+        print(f"Selected box for removal: {name} at position {pos}")
+        self.removed_box_path = prim_path
+        return True
+
+    def apply_removal_to_selected_box(self):
+        """删除已选择的箱子"""
+        if self.removed_box_path is None:
+            print("No box selected for removal")
+            return False
+
+        # 直接删除箱子
+        self.box_gen.delete_box(self.removed_box_path)
+        return True
+
+    def check_stability(self) -> dict:
+        """
+        检测移除箱子后其他箱子的稳定性
+
+        Returns:
+            dict: 稳定性检测结果
+        """
+        # 获取当前位置（排除被移除的箱子）
+        positions_after = self.box_gen.get_all_box_positions(
+            exclude_paths=[self.removed_box_path]
+        )
+
+        moved_boxes = []
+        stable_boxes = []
+
+        for path, pos_before in self.positions_before_removal.items():
+            if path == self.removed_box_path:
+                continue
+            if path not in positions_after:
+                continue
+
+            pos_after = positions_after[path]
+            displacement = np.linalg.norm(pos_after - pos_before)
+
+            box_name = path.split("/")[-1]
+            if displacement > self.stability_threshold:
+                moved_boxes.append({
+                    "name": box_name,
+                    "path": path,
+                    "displacement": displacement,
+                    "pos_before": pos_before,
+                    "pos_after": pos_after
+                })
+            else:
+                stable_boxes.append(box_name)
+
+        # 判断整体稳定性
+        is_stable = len(moved_boxes) == 0
+
+        return {
+            "is_stable": is_stable,
+            "moved_boxes": moved_boxes,
+            "stable_boxes": stable_boxes,
+            "total_boxes": len(positions_after)
+        }
+
+    def print_stability_report(self, result: dict):
+        """打印稳定性检测报告"""
+        print("\n" + "=" * 50)
+        print("稳定性检测报告")
+        print("=" * 50)
+
+        removed_name = self.removed_box_path.split("/")[-1]
+        print(f"被移除的箱子: {removed_name}")
+        print(f"剩余箱子数量: {result['total_boxes']}")
+        print(f"位移阈值: {self.stability_threshold * 100:.1f} cm")
+        print("-" * 50)
+
+        if result["is_stable"]:
+            print("结果: ✓ 稳定")
+            print("所有箱子位置变化均在阈值内")
         else:
-            # 侧面抓取
-            grasp_point = self.grasp_info["grasp_point"]
-            approach_vec = self.grasp_info["approach_vector"]
+            print(f"结果: ✗ 不稳定")
+            print(f"发生位移的箱子数量: {len(result['moved_boxes'])}")
+            print("\n位移详情:")
+            for box in result["moved_boxes"]:
+                print(f"  - {box['name']}: 位移 {box['displacement']*100:.2f} cm")
 
-            # 安全位置：在抓取点上方
-            self.safe_pos = np.array([grasp_point[0], grasp_point[1], 0.50])
+        print("=" * 50 + "\n")
 
-            # 接近位置：沿接近方向后退15cm
-            self.approach_pos = grasp_point - approach_vec * 0.15
+    def print_final_summary(self):
+        """打印所有测试轮次的总结"""
+        print("\n" + "=" * 60)
+        print("最终测试总结")
+        print("=" * 60)
+        print(f"总测试轮次: {len(self.test_results)}")
 
-            # 抓取位置：距离侧面2cm
-            self.pick_pos = grasp_point - approach_vec * 0.02
+        stable_count = sum(1 for r in self.test_results if r["is_stable"])
+        unstable_count = len(self.test_results) - stable_count
 
-            # 提升位置：先后退再提升
-            self.lift_pos = np.array([
-                grasp_point[0] - approach_vec[0] * 0.10,
-                grasp_point[1] - approach_vec[1] * 0.10,
-                0.40
-            ])
+        print(f"稳定次数: {stable_count}")
+        print(f"不稳定次数: {unstable_count}")
+        print("-" * 60)
 
-        print(f"Safe pos: {self.safe_pos}")
-        print(f"Approach pos: {self.approach_pos}")
-        print(f"Pick pos: {self.pick_pos}")
-        print(f"Lift pos: {self.lift_pos}")
+        for i, result in enumerate(self.test_results):
+            status = "稳定" if result["is_stable"] else "不稳定"
+            moved = len(result["moved_boxes"])
+            print(f"轮次 {i+1}: 移除 {result['removed_box']} -> {status} (位移箱子: {moved})")
 
-        # 移动到安全高度
-        self.ur5.move_to_pose(self.safe_pos, approach_direction=self.grasp_direction)
-
-    def _start_pick_sequence(self):
-        """开始抓取序列，根据phase选择目标箱子"""
-        if self.phase == 0:
-            # 第一阶段：抓取最顶上的箱子（稳定抓取）
-            topmost = self.box_gen.get_topmost_box()
-            if topmost is None:
-                print("Error: Cannot find any box")
-                return
-            self.target_box_path, box_pos, self.target_box_size = topmost
-            self.first_box_path = self.target_box_path
-            self.grasp_direction = "top"
-            self.grasp_info = None
-            print(f"=== S1: 选择最顶部箱子（稳定抓取）===")
-        else:
-            # 第二阶段：抓取边缘支撑箱子（不稳定抓取）
-            result = self.box_gen.get_unstable_graspable_box(
-                exclude_paths=[self.first_box_path] if self.first_box_path else None
-            )
-            if result is None:
-                print("Error: Cannot find unstable box")
-                return
-            self.target_box_path, box_pos, self.target_box_size, self.grasp_info = result
-            self.grasp_direction = self.grasp_info["direction"]
-            print(f"=== S2: 选择边缘支撑箱子（不稳定抓取）===")
-            print(f"抓取方向: {self.grasp_direction}")
-
-        box_height = self.target_box_size[2]
-        print(f"Target box: {self.target_box_path}")
-        print(f"Box position: {box_pos}, size: {self.target_box_size}")
-
-        # 根据抓取方向计算路径点
-        self._calculate_pick_waypoints(box_pos, box_height)
+        print("=" * 60 + "\n")
 
     def run(self):
         """运行仿真"""
@@ -268,117 +374,115 @@ class BoxPickSimulation:
 
         # 重置世界
         self.world.reset()
-        self.ur5.initialize()
 
-        # 初始化吸盘 (必须在world.reset之后)
-        self.gripper.initialize(self.world)
-
-        # 设置UR5到直立姿态
-        self.ur5.set_home_position()
-
-        print("Starting pick and place simulation...")
-        print("Step 1: UR5 moving to upright position...")
+        print("Starting simulation...")
 
         # 主仿真循环
         while simulation_app.is_running():
             self.world.step(render=True)
             self.step_count += 1
 
-            # 每步更新轨迹插值
-            self.ur5.update_motion()
-
-            # 更新吸盘状态
-            self.gripper.update()
-
             # 状态机控制
             if self.state == "INIT":
-                # 等待UR5到达直立姿态
-                if self.step_count == self.home_steps:
-                    print("UR5 is now upright.")
-                    print(f"Step 2: Spawning 50 boxes at step {self.box_spawn_step}...")
-
-                # 在指定时机生成箱子
+                # 在指定时机生成箱子（分三批）
                 if self.step_count == self.box_spawn_step:
-                    self.spawn_box()
-                    print(f"Step 3: Waiting for boxes to fall and stabilize (until step {self.stable_steps})...")
+                    self.spawn_box(batch=1)
 
-                # 箱子稳定后开始抓取
-                if self.step_count == self.stable_steps:
-                    print("=== S0: 环境已稳定 ===")
-                    self._start_pick_sequence()
-                    self.state = "SAFE_HEIGHT"
+                if self.step_count == self.box_spawn_step_2:
+                    self.spawn_box(batch=2)
 
-            elif self.state == "SAFE_HEIGHT" and self.ur5.is_motion_complete():
-                ee_pos, _ = self.ur5.get_end_effector_pose()
-                if ee_pos is not None:
-                    print(f"Reached safe height. EE position: {ee_pos}")
-                print(f"Step 5: Approaching box at {self.approach_pos}")
-                self.ur5.move_to_pose(self.approach_pos, approach_direction=self.grasp_direction)
-                self.state = "APPROACH"
-
-            elif self.state == "APPROACH" and self.ur5.is_motion_complete():
-                ee_pos, _ = self.ur5.get_end_effector_pose()
-                if ee_pos is not None:
-                    print(f"Reached approach. EE position: {ee_pos}")
-                print(f"Step 6: Moving to pick position {self.pick_pos}")
-                self.ur5.move_to_pose(self.pick_pos, approach_direction=self.grasp_direction)
-                self.state = "PICK"
-
-            elif self.state == "PICK" and self.ur5.is_motion_complete():
-                ee_pos, _ = self.ur5.get_end_effector_pose()
-                print(f"=== PICK位置对比 ===")
-                print(f"目标位置: {self.pick_pos}")
-                print(f"实际EE位置: {ee_pos}")
-                print(f"抓取方向: {self.grasp_direction}")
-                print(f"====================")
-                print("Step 7: Activating suction gripper")
-                self.gripper.activate(self.target_box_path, self.grasp_direction)
-                self.state = "GRASP"
-                self.grasp_delay = 0
-
-            elif self.state == "GRASP":
-                self.grasp_delay += 1
-                if self.grasp_delay > 30:
-                    print("Step 8: Lifting box")
-                    self.ur5.move_to_pose(self.lift_pos, approach_direction="top")
-                    self.state = "LIFT"
-
-            elif self.state == "LIFT" and self.ur5.is_motion_complete():
-                self.state = "HOLD"
-                self.hold_timer = 0
-                if self.phase == 0:
-                    print("=== S1: 稳定抓取完成，保持5秒 ===")
-                else:
-                    print("=== S2: 不稳定抓取完成，保持20秒观察倒塌 ===")
+                if self.step_count == self.box_spawn_step_3:
+                    self.spawn_box(batch=3)
+                    self.state = "HOLD"
+                    self.hold_timer = 0
+                    print("All boxes dropped, holding for 20 seconds...")
 
             elif self.state == "HOLD":
                 self.hold_timer += 1
-                duration = self.hold_duration_s1 if self.phase == 0 else self.hold_duration_s2
+                # 等待2秒让箱子稳定
+                if self.hold_timer == 120:
+                    # 第一次进入时保存初始场景状态和图像
+                    if self.initial_scene_state is None:
+                        self.initial_scene_state = self.box_gen.save_scene_state()
+                        self.capture_initial_state()
+                        # 获取所有可见箱子
+                        self.visible_boxes_to_test = self.get_all_visible_boxes()
+                        self.total_boxes_to_test = len(self.visible_boxes_to_test)
+                        print(f"\n{'='*50}")
+                        print(f"开始循环测试，共 {self.total_boxes_to_test} 个可见箱子")
+                        print(f"{'='*50}\n")
 
-                if self.hold_timer >= duration:
-                    if self.phase == 0:
-                        # 第一阶段完成，放回箱子
-                        print("5秒保持完成，释放箱子并回到S0...")
-                        self.gripper.deactivate()
-                        self.state = "RELEASE_WAIT"
-                        self.hold_timer = 0
-                    else:
-                        # 第二阶段完成，结束仿真
-                        print("20秒保持完成，仿真结束")
+                # 额外等待30帧(0.5秒)再开始测试，确保位置稳定
+                if self.hold_timer == 150:
+                    # 检查是否还有箱子待测试
+                    if not self.visible_boxes_to_test:
+                        print("没有可见箱子可测试，结束")
+                        self.print_final_summary()
                         self.state = "DONE"
+                    else:
+                        self.test_iteration += 1
+                        print(f"\n--- 测试轮次 {self.test_iteration}/{self.total_boxes_to_test} ---")
 
-            elif self.state == "RELEASE_WAIT":
+                        # 选择下一个要移除的箱子
+                        self.select_next_box_for_removal()
+                        # 记录移除前位置
+                        self.positions_before_removal = self.box_gen.get_all_box_positions()
+                        # 进入移除状态
+                        self.state = "REMOVE_BOX"
+
+            elif self.state == "REMOVE_BOX":
+                if not self.removal_force_applied:
+                    # 删除箱子
+                    self.apply_removal_to_selected_box()
+                    self.removal_force_applied = True
+                    self.post_removal_timer = 0
+                else:
+                    # 等待箱子稳定
+                    self.post_removal_timer += 1
+                    if self.post_removal_timer >= self.post_removal_wait:
+                        # 进行稳定性检测
+                        stability_result = self.check_stability()
+                        self.print_stability_report(stability_result)
+
+                        # 记录测试结果
+                        removed_name = self.removed_box_path.split("/")[-1]
+                        stability_result["removed_box"] = removed_name
+                        self.test_results.append(stability_result)
+
+                        # 保存标注结果图（绿色=消失，红色=受影响）
+                        self.save_annotated_result(
+                            self.test_iteration,
+                            self.removed_box_path,
+                            stability_result["moved_boxes"]
+                        )
+
+                        # 判断是否继续下一轮
+                        if self.visible_boxes_to_test:
+                            # 还有箱子待测试，恢复场景
+                            print(f"\n恢复场景到初始状态...")
+                            self.box_gen.restore_scene_state(self.initial_scene_state)
+                            # 重置状态变量
+                            self.removal_force_applied = False
+                            self.removed_box_path = None
+                            self.hold_timer = 0
+                            self.state = "RESTORE_WAIT"
+                        else:
+                            # 所有测试完成
+                            self.print_final_summary()
+                            self.state = "DONE"
+
+            elif self.state == "RESTORE_WAIT":
+                # 等待场景恢复稳定
                 self.hold_timer += 1
-                # 等待箱子落下稳定
-                if self.hold_timer >= 180:  # 等待3秒
-                    print("=== 回到S0，准备第二次抓取 ===")
-                    self.phase = 1
-                    self._start_pick_sequence()
-                    self.state = "SAFE_HEIGHT"
+                if self.hold_timer >= 60:  # 等待1秒
+                    self.hold_timer = 0
+                    self.state = "HOLD"
 
             elif self.state == "DONE":
-                print("仿真完成，关闭...")
-                break
+                self.hold_timer += 1
+                if self.hold_timer >= self.hold_duration:
+                    print("Simulation complete, closing...")
+                    break
 
         simulation_app.close()
 
