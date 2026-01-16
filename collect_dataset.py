@@ -76,7 +76,7 @@ class DatasetCollector:
         # 时序控制
         self.hold_duration = 120
         self.hold_timer = 0
-        self.max_wait_frames = 180  # 最大等待帧数（超时保护）
+        self.max_wait_frames = 240  # 最大等待帧数（约4秒@60FPS）
         self.wait_frame_count = 0
 
         # 采集相关
@@ -248,8 +248,8 @@ class DatasetCollector:
                     "box_position": [round(p, 4) for p in box_position]
                 })
 
-            # 判断是否可见（去掉了最小像素数限制）
-            if expected_pixels > 0 and visibility_ratio >= min_visible_ratio:
+            # 判断是否可见
+            if expected_pixels > 0 and visibility_ratio >= min_visible_ratio and actual_pixels >= 200:
                 visible_paths.add(box_prim_path)
 
         return visible_paths
@@ -598,7 +598,7 @@ class DatasetCollector:
                 converged = self.stability_checker.check_converged(
                     self.box_gen, min_stable_frames=10, excluded_path=self.removed_box_path
                 )
-                if converged or self.wait_frame_count >= self.max_wait_frames:
+                if converged or self.wait_frame_count >= 120:  # 移除后等待2秒
                     result = self.stability_checker.check(self.box_gen, self.removed_box_path)
                     box = self.visible_boxes_to_test[self.current_test_index]
                     self.save_removal_result(self.current_test_index, box, result)
