@@ -30,3 +30,8 @@ dist/
 
 # 数据集
 dataset/
+
+result/
+train/checkpoints/
+train/checkpoints_twostream/
+train/checkpoints_vit/
