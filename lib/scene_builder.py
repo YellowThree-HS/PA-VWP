@@ -115,7 +115,23 @@ class SceneBuilder:
         floor_prim = stage.GetPrimAtPath(floor_path)
         UsdShade.MaterialBindingAPI(floor_prim).Bind(material)
 
-        print(f"Applied floor texture: {texture_path.name}")
+    def randomize_floor_texture(self):
+        """随机更换地面纹理"""
+        stage = omni.usd.get_context().get_stage()
+
+        texture_files = list(self.floor_texture_dir.glob("*.jpg"))
+        if not texture_files:
+            return
+
+        texture_path = random.choice(texture_files)
+        texture_abs_path = str(texture_path.absolute()).replace("\\", "/")
+
+        # 更新纹理采样器的文件路径
+        tex_path = "/World/Materials/FloorMaterial/DiffuseTexture"
+        tex_prim = stage.GetPrimAtPath(tex_path)
+        if tex_prim.IsValid():
+            tex_sampler = UsdShade.Shader(tex_prim)
+            tex_sampler.GetInput("file").Set(texture_abs_path)
 
     def create_lights(self, stage=None):
         """创建场景光源"""

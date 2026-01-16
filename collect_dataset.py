@@ -22,26 +22,45 @@ import numpy as np
 import cv2
 import os
 import json
+import time
 from isaacsim.core.api import World
+import omni.usd
+import omni.replicator.core as rep
+from pxr import UsdLux, UsdGeom, Gf
 
 import sys
 sys.path.append("src")
 sys.path.append(".")
 from box_generator import BoxGenerator
-from lib import CameraManager, StabilityChecker, ImageUtils
+from lib import CameraManager, StabilityChecker, ImageUtils, SceneBuilder
+
+# 九相机配置：八个方向 + 正上方
+MULTI_CAMERA_CONFIGS = {
+    "top": {"position": (0.45, 0.0, 1.5), "rotation": (0, 0, 180)},
+    "north": {"position": (0.45, 1.0, 1.5), "rotation": (-30, 0, 0)},
+    "south": {"position": (0.45, -1.0, 1.5), "rotation": (-30, 0, 180)},
+    "east": {"position": (1.45, 0.0, 1.5), "rotation": (-30, 0, -90)},
+    "west": {"position": (-0.55, 0.0, 1.5), "rotation": (-30, 0, 90)},
+    "northeast": {"position": (1.15, 0.70, 1.5), "rotation": (-30, 0, -45)},
+    "northwest": {"position": (-0.25, 0.70, 1.5), "rotation": (-30, 0, 45)},
+    "southeast": {"position": (1.15, -0.70, 1.5), "rotation": (-30, 0, -135)},
+    "southwest": {"position": (-0.25, -0.70, 1.5), "rotation": (-30, 0, 135)},
+}
 
 
 class DatasetCollector:
-    """数据集采集器（无头模式）"""
+    """数据集采集器（无头模式）- 每个round保存9组数据（9个视角）"""
 
     def __init__(self, output_dir: str = "dataset"):
         self.world = None
         self.box_gen = None
+        self.scene_builder = SceneBuilder()
         self.camera = CameraManager()
+        self.multi_cameras = {}  # 九视角相机
         self.stability_checker = StabilityChecker(threshold=0.02)
 
         self.output_dir = output_dir
-        self.current_round_dir = None
+        self.current_round_base_dir = None  # round基础目录
 
         # 状态机
         self.state = "INIT"
@@ -57,8 +76,8 @@ class DatasetCollector:
         # 时序控制
         self.hold_duration = 120
         self.hold_timer = 0
-        self.post_removal_wait = 60
-        self.post_removal_timer = 0
+        self.max_wait_frames = 180  # 最大等待帧数（超时保护）
+        self.wait_frame_count = 0
 
         # 采集相关
         self.round_index = 0
@@ -70,11 +89,14 @@ class DatasetCollector:
         self.initial_scene_state = None
         self.round_results = []
 
-        # 图像数据
-        self.initial_rgb = None
-        self.initial_depth = None
-        self.initial_mask = None
-        self.initial_id_to_labels = None
+        # 每个视角的图像数据
+        self.camera_data = {}  # {视角名: {rgb, depth, mask, id_to_labels}}
+
+        # 统计信息
+        self.total_rounds = 0
+        self.start_time = None
+        self.round_start_time = None
+        self.total_samples = 0
 
         self._detect_existing_rounds()
 
@@ -92,29 +114,217 @@ class DatasetCollector:
                     pass
         if max_round > 0:
             self.round_index = max_round
-            print(f"Continue from round {max_round + 1}")
 
     def setup_scene(self):
         """设置场景"""
         self.world = World(stage_units_in_meters=1.0)
-        self.world.scene.add_default_ground_plane()
-        self.box_gen = BoxGenerator()
+        self.scene_builder.create_textured_floor(size=5.0)
+        self.box_gen = BoxGenerator(texture_dir="assets/cardboard_textures_processed")
         self.camera.create_top_camera(with_depth=True)
-        print("Scene setup complete")
+        self.create_multi_cameras()
+
+    def create_multi_cameras(self):
+        """创建九个方向的相机（含RGB、depth、segmentation）"""
+        stage = omni.usd.get_context().get_stage()
+
+        for name, config in MULTI_CAMERA_CONFIGS.items():
+            cam_path = f"/World/Camera_{name}"
+            camera = UsdGeom.Camera.Define(stage, cam_path)
+            xform = UsdGeom.Xformable(camera.GetPrim())
+            xform.AddTranslateOp().Set(Gf.Vec3d(*config["position"]))
+            xform.AddRotateXYZOp().Set(Gf.Vec3f(*config["rotation"]))
+            camera.GetFocalLengthAttr().Set(18.0)
+
+            render_product = rep.create.render_product(cam_path, (640, 480))
+
+            # RGB annotator
+            rgb_annotator = rep.AnnotatorRegistry.get_annotator("rgb")
+            rgb_annotator.attach([render_product])
+
+            # Depth annotator
+            depth_annotator = rep.AnnotatorRegistry.get_annotator("distance_to_camera")
+            depth_annotator.attach([render_product])
+
+            # Segmentation annotator
+            seg_annotator = rep.AnnotatorRegistry.get_annotator("instance_id_segmentation")
+            seg_annotator.attach([render_product])
+
+            self.multi_cameras[name] = {
+                "path": cam_path,
+                "render_product": render_product,
+                "rgb_annotator": rgb_annotator,
+                "depth_annotator": depth_annotator,
+                "seg_annotator": seg_annotator,
+            }
+
+    def get_visible_boxes_for_view(self, view_name: str, min_visible_ratio: float = 0.2, collect_stats: bool = False) -> set:
+        """
+        获取单个视角可见的箱子prim_path集合
+
+        使用基于3D投影的可见性判断：实际像素数 / 理论投影像素数
+
+        Args:
+            view_name: 视角名称
+            min_visible_ratio: 最小可见比例阈值
+            collect_stats: 是否收集统计数据
+
+        Returns:
+            visible_paths: 可见箱子路径集合
+            如果 collect_stats=True，还会在 self.visibility_stats[view_name] 中保存统计数据
+        """
+        cam_data = self.camera_data.get(view_name)
+        if not cam_data:
+            return set()
+
+        mask = cam_data["mask"]
+        id_to_labels = cam_data["id_to_labels"]
+
+        if mask is None:
+            return set()
+
+        # 获取相机配置
+        cam_config = MULTI_CAMERA_CONFIGS.get(view_name, {})
+        cam_position = cam_config.get("position", (0, 0, 1.5))
+
+        unique_ids = np.unique(mask)
+        visible_paths = set()
+
+        # 收集统计数据
+        if collect_stats:
+            if not hasattr(self, 'visibility_stats'):
+                self.visibility_stats = {}
+            self.visibility_stats[view_name] = []
+
+        for uid in unique_ids:
+            if uid == 0:
+                continue
+            label_str = str(id_to_labels.get(str(uid), ""))
+            if "/World/box_" not in label_str:
+                continue
+
+            # 获取实际像素数
+            actual_pixels = int(np.sum(mask == uid))
+
+            # 查找对应的箱子信息
+            box_info = None
+            box_name = None
+            box_prim_path = None
+            for name, info in self.box_gen.boxes.items():
+                if label_str.startswith(info["prim_path"] + "/") or label_str == info["prim_path"]:
+                    box_info = info
+                    box_name = name
+                    box_prim_path = info["prim_path"]
+                    break
+
+            if box_info is None:
+                continue
+
+            # 获取箱子当前位置
+            box_position = self.box_gen.get_box_position(box_name)
+            if box_position is None:
+                continue
+
+            # 估算理论投影像素数
+            expected_pixels = ImageUtils.estimate_projected_pixels(
+                box_size=box_info["size"],
+                box_position=box_position,
+                camera_position=cam_position,
+                focal_length=18.0,
+                image_size=(640, 480)
+            )
+
+            # 计算可见比例
+            visibility_ratio = actual_pixels / expected_pixels if expected_pixels > 0 else 0
+
+            # 收集统计数据（不做任何过滤）
+            if collect_stats:
+                self.visibility_stats[view_name].append({
+                    "box_name": box_name,
+                    "prim_path": box_prim_path,
+                    "actual_pixels": actual_pixels,
+                    "expected_pixels": int(expected_pixels),
+                    "visibility_ratio": round(visibility_ratio, 4),
+                    "box_size": [round(s, 4) for s in box_info["size"]],
+                    "box_position": [round(p, 4) for p in box_position]
+                })
+
+            # 判断是否可见（去掉了最小像素数限制）
+            if expected_pixels > 0 and visibility_ratio >= min_visible_ratio:
+                visible_paths.add(box_prim_path)
+
+        return visible_paths
+
+    def get_all_views_visible_boxes(self, min_visible_ratio: float = 0.2) -> list:
+        """获取所有视角可见箱子的并集"""
+        all_visible_paths = set()
+
+        # 收集所有视角可见的箱子路径
+        for view_name in self.camera_data.keys():
+            visible_paths = self.get_visible_boxes_for_view(view_name, min_visible_ratio)
+            all_visible_paths.update(visible_paths)
+
+        # 转换为箱子信息列表
+        visible_boxes = []
+        for name, info in self.box_gen.boxes.items():
+            if info["prim_path"] in all_visible_paths:
+                visible_boxes.append({
+                    "name": name,
+                    "prim_path": info["prim_path"],
+                    "uid": 0
+                })
+
+        return visible_boxes
+
+    def randomize_lighting(self):
+        """随机化环境光"""
+        stage = omni.usd.get_context().get_stage()
+
+        # 查找或创建 DomeLight (环境光)
+        dome_light_path = "/World/DomeLight"
+        prim = stage.GetPrimAtPath(dome_light_path)
+        if prim.IsValid():
+            dome_light = UsdLux.DomeLight(prim)
+        else:
+            dome_light = UsdLux.DomeLight.Define(stage, dome_light_path)
+
+        # 随机强度
+        intensity = np.random.uniform(300, 1200)
+        dome_light.GetIntensityAttr().Set(intensity)
+
+        # 随机旋转 (改变阴影方向)
+        xform = UsdGeom.Xformable(dome_light)
+        xform.ClearXformOpOrder()
+        xform.AddRotateXYZOp().Set(Gf.Vec3f(
+            np.random.uniform(0, 360),
+            np.random.uniform(0, 360),
+            0
+        ))
+
+        # 随机色温 (冷光/暖光)
+        enable_temp = dome_light.GetEnableColorTemperatureAttr()
+        enable_temp.Set(True)
+        temp = np.random.uniform(4000, 8000)
+        dome_light.GetColorTemperatureAttr().Set(temp)
 
     def start_new_round(self):
         """开始新一轮"""
         self.round_index += 1
+        self.round_start_time = time.time()
         self.current_box_count = np.random.randint(self.min_boxes, self.max_boxes + 1)
 
-        # 创建目录
-        self.current_round_dir = os.path.join(
-            self.output_dir, f"round_{self.round_index:04d}_{self.current_box_count}"
-        )
-        os.makedirs(os.path.join(self.current_round_dir, "initial"), exist_ok=True)
-        os.makedirs(os.path.join(self.current_round_dir, "removals"), exist_ok=True)
+        # 随机化光照和地面
+        self.randomize_lighting()
+        self.scene_builder.randomize_floor_texture()
 
-        print(f"\nRound {self.round_index}: {self.current_box_count} boxes")
+        # 基础目录名（不含视角后缀）
+        self.current_round_base_dir = os.path.join(
+            self.output_dir, f"round_{self.round_index:03d}_{self.current_box_count}"
+        )
+
+        # 为每个视角创建目录
+        for view_name in MULTI_CAMERA_CONFIGS.keys():
+            view_dir = f"{self.current_round_base_dir}_{view_name}"
+            os.makedirs(view_dir, exist_ok=True)
 
         # 计算分批生成
         batch_size = self.current_box_count // 3
@@ -128,6 +338,7 @@ class DatasetCollector:
         self.current_test_index = 0
         self.round_results = []
         self.initial_scene_state = None
+        self.camera_data = {}
         self.hold_timer = 0
         self.step_count = 0
         self.state = "SPAWNING"
@@ -139,11 +350,10 @@ class DatasetCollector:
             center=[0.45, 0.0],
             spread=0.15,
             drop_height=0.30,
-            size_range=((0.06, 0.12), (0.06, 0.12), (0.06, 0.12)),
+            size_range=((0.05, 0.20), (0.05, 0.20), (0.05, 0.20)),
             mass_range=(0.3, 1.5)
         )
         self.box_paths.extend(paths)
-        print(f"Spawned {count}, total: {len(self.box_paths)}")
 
     def clear_scene(self):
         """清除场景"""
@@ -154,89 +364,193 @@ class DatasetCollector:
         self.box_gen._box_count = 0
 
     def capture_initial_state(self):
-        """捕获初始状态"""
-        initial_dir = os.path.join(self.current_round_dir, "initial")
+        """捕获初始状态 - 为每个视角保存RGB、depth、mask，并记录各视角可见箱子"""
+        for view_name, cam_info in self.multi_cameras.items():
+            view_dir = f"{self.current_round_base_dir}_{view_name}"
 
-        self.initial_rgb = self.camera.get_rgb()
-        if self.initial_rgb is not None:
-            ImageUtils.save_rgb(self.initial_rgb, os.path.join(initial_dir, "rgb.png"))
+            # 获取RGB
+            rgb_annotator = cam_info["rgb_annotator"]
+            rgb_data = rgb_annotator.get_data()
+            rgb = rgb_data[:, :, :3].copy() if rgb_data is not None else None
 
-        self.initial_depth = self.camera.get_depth()
-        if self.initial_depth is not None:
-            ImageUtils.save_depth(self.initial_depth, os.path.join(initial_dir, "depth.png"))
-            np.save(os.path.join(initial_dir, "depth.npy"), self.initial_depth)
+            # 获取depth和mask
+            depth_data = cam_info["depth_annotator"].get_data() if "depth_annotator" in cam_info else None
+            mask_data, id_to_labels = None, {}
+            if "seg_annotator" in cam_info:
+                seg_data = cam_info["seg_annotator"].get_data()
+                if seg_data is not None:
+                    mask_data = seg_data["data"]
+                    id_to_labels = seg_data.get("info", {}).get("idToLabels", {})
 
-        self.initial_mask, self.initial_id_to_labels = self.camera.get_segmentation()
-        if self.initial_mask is not None:
-            np.save(os.path.join(initial_dir, "mask.npy"), self.initial_mask)
+            # 存储到camera_data
+            self.camera_data[view_name] = {
+                "rgb": rgb,
+                "depth": depth_data,
+                "mask": mask_data,
+                "id_to_labels": id_to_labels
+            }
 
-        # 保存可见箱子信息
-        visible_info = [{"name": b["name"], "prim_path": b["prim_path"],
-                         "uid": int(b["uid"])} for b in self.visible_boxes_to_test]
-        with open(os.path.join(initial_dir, "visible_boxes.json"), "w") as f:
-            json.dump(visible_info, f, indent=2)
+            # 保存初始图像
+            if rgb is not None:
+                noisy_rgb = ImageUtils.add_camera_noise(rgb)
+                ImageUtils.save_rgb(noisy_rgb, os.path.join(view_dir, "rgb.png"))
+
+            if depth_data is not None:
+                noisy_depth = ImageUtils.add_depth_noise(depth_data)
+                ImageUtils.save_depth(noisy_depth, os.path.join(view_dir, "depth.png"))
+                np.save(os.path.join(view_dir, "depth.npy"), noisy_depth)
+
+            if mask_data is not None:
+                np.save(os.path.join(view_dir, "mask.npy"), mask_data)
+
+        # 获取所有视角可见箱子的并集（用于测试）
+        self.visible_boxes_to_test = self.get_all_views_visible_boxes()
+
+        # 为每个视角保存该视角可见的箱子信息和掩码
+        for view_name in self.camera_data.keys():
+            view_dir = f"{self.current_round_base_dir}_{view_name}"
+            cam_data = self.camera_data[view_name]
+            mask_data = cam_data["mask"]
+            id_to_labels = cam_data["id_to_labels"]
+
+            # 获取该视角可见的箱子路径，同时收集统计数据
+            view_visible_paths = self.get_visible_boxes_for_view(view_name, collect_stats=True)
+            self.camera_data[view_name]["visible_paths"] = view_visible_paths
+
+            # 保存可见性统计数据到JSON（用于分析阈值）
+            if hasattr(self, 'visibility_stats') and view_name in self.visibility_stats:
+                stats_file = os.path.join(view_dir, "visibility_stats.json")
+                with open(stats_file, "w") as f:
+                    json.dump(self.visibility_stats[view_name], f, indent=2)
+
+            if mask_data is not None:
+                # 保存该视角可见箱子掩码
+                visible_mask = np.zeros_like(mask_data, dtype=np.uint8)
+                for box_path in view_visible_paths:
+                    box_id = ImageUtils.get_mask_id(box_path, id_to_labels)
+                    if box_id is not None:
+                        visible_mask[mask_data == box_id] = 255
+                cv2.imwrite(os.path.join(view_dir, "visible_mask.png"), visible_mask)
+
+            # 保存该视角可见箱子列表
+            view_visible_info = [
+                {"name": name, "prim_path": info["prim_path"]}
+                for name, info in self.box_gen.boxes.items()
+                if info["prim_path"] in view_visible_paths
+            ]
+            with open(os.path.join(view_dir, "visible_boxes.json"), "w") as f:
+                json.dump(view_visible_info, f, indent=2)
 
     def save_removal_result(self, test_index: int, box: dict, result: dict):
-        """保存移除结果"""
-        box_dir = os.path.join(self.current_round_dir, "removals", str(test_index))
-        os.makedirs(box_dir, exist_ok=True)
+        """保存移除结果 - 只为该视角可见的箱子保存数据"""
+        for view_name, cam_data in self.camera_data.items():
+            view_visible_paths = cam_data.get("visible_paths", set())
 
-        # 标注图
-        if self.initial_rgb is not None and self.initial_mask is not None:
-            annotated = ImageUtils.create_annotated_image(
-                self.initial_rgb, self.initial_mask,
-                self.initial_id_to_labels, box["prim_path"], result["moved_boxes"]
-            )
-            cv2.imwrite(os.path.join(box_dir, "annotated.png"), annotated)
+            # 如果被移除的箱子在该视角不可见，跳过保存
+            if box["prim_path"] not in view_visible_paths:
+                continue
 
-            # 消失箱子掩码
-            removed_id = ImageUtils.get_mask_id(box["prim_path"], self.initial_id_to_labels)
-            if removed_id is not None:
-                mask_img = (self.initial_mask == removed_id).astype(np.uint8) * 255
-                cv2.imwrite(os.path.join(box_dir, "mask.png"), mask_img)
+            view_dir = f"{self.current_round_base_dir}_{view_name}"
+            box_dir = os.path.join(view_dir, "removals", str(test_index))
+            os.makedirs(box_dir, exist_ok=True)
 
-        # 保存结果JSON
-        result_data = {
-            "removed_box": {"name": box["name"], "prim_path": box["prim_path"], "uid": int(box["uid"])},
-            "is_stable": result["is_stable"],
-            "stability_label": result["stability_label"],
-            "affected_boxes": result["moved_boxes"]
-        }
-        with open(os.path.join(box_dir, "result.json"), "w") as f:
-            json.dump(result_data, f, indent=2)
+            rgb = cam_data["rgb"]
+            mask = cam_data["mask"]
+            id_to_labels = cam_data["id_to_labels"]
 
-        status = "稳定" if result["is_stable"] else "不稳定"
-        print(f"  [{test_index}] {box['name']}: {status}")
+            if rgb is not None and mask is not None:
+                # 标注图（红绿掩码）
+                annotated = ImageUtils.create_annotated_image(
+                    rgb, mask, id_to_labels, box["prim_path"], result["moved_boxes"]
+                )
+                cv2.imwrite(os.path.join(box_dir, "annotated.png"), annotated)
+
+                # 消失箱子掩码
+                removed_id = ImageUtils.get_mask_id(box["prim_path"], id_to_labels)
+                if removed_id is not None:
+                    removed_mask = (mask == removed_id).astype(np.uint8) * 255
+                    cv2.imwrite(os.path.join(box_dir, "removed_mask.png"), removed_mask)
+
+                # 受影响箱子掩码（只保存该视角可见的受影响箱子）
+                affected_mask = np.zeros_like(mask, dtype=np.uint8)
+                visible_affected = []
+                for affected_box in result["moved_boxes"]:
+                    box_path = affected_box.get("path", affected_box.get("prim_path", ""))
+                    if box_path in view_visible_paths:
+                        affected_id = ImageUtils.get_mask_id(box_path, id_to_labels)
+                        if affected_id is not None:
+                            affected_mask[mask == affected_id] = 255
+                        visible_affected.append(affected_box)
+                cv2.imwrite(os.path.join(box_dir, "affected_mask.png"), affected_mask)
+
+                # 保存结果JSON（只包含该视角可见的受影响箱子）
+                result_data = {
+                    "removed_box": {"name": box["name"], "prim_path": box["prim_path"]},
+                    "is_stable": result["is_stable"],
+                    "stability_label": result["stability_label"],
+                    "affected_boxes": visible_affected
+                }
+                with open(os.path.join(box_dir, "result.json"), "w") as f:
+                    json.dump(result_data, f, indent=2)
 
     def save_round_summary(self):
-        """保存轮次总结"""
+        """保存轮次总结 - 每个视角只显示该视角可见的箱子"""
         stable = [r["removed_box"] for r in self.round_results if r["is_stable"]]
         unstable = [r["removed_box"] for r in self.round_results if not r["is_stable"]]
 
-        # 总结图
-        if self.initial_rgb is not None and self.initial_mask is not None:
-            summary = ImageUtils.create_summary_image(
-                self.initial_rgb, self.initial_mask,
-                self.initial_id_to_labels, stable, unstable
-            )
-            cv2.imwrite(os.path.join(self.current_round_dir, "summary.png"), summary)
+        # 为每个视角保存总结图
+        for view_name, cam_data in self.camera_data.items():
+            view_dir = f"{self.current_round_base_dir}_{view_name}"
+            view_visible_paths = cam_data.get("visible_paths", set())
+            rgb = cam_data["rgb"]
+            mask = cam_data["mask"]
+            id_to_labels = cam_data["id_to_labels"]
 
-        # 总结JSON
-        summary_data = {
-            "total_boxes": self.current_box_count,
-            "tested": len(self.round_results),
-            "stable_count": len(stable),
-            "unstable_count": len(unstable)
-        }
-        with open(os.path.join(self.current_round_dir, "summary.json"), "w") as f:
-            json.dump(summary_data, f, indent=2)
-        print(f"Round summary: {len(stable)} stable, {len(unstable)} unstable")
+            # 过滤出该视角可见的箱子
+            view_stable = [b for b in stable if b["prim_path"] in view_visible_paths]
+            view_unstable = [b for b in unstable if b["prim_path"] in view_visible_paths]
+
+            if rgb is not None and mask is not None:
+                summary = ImageUtils.create_summary_image(
+                    rgb, mask, id_to_labels, view_stable, view_unstable
+                )
+                cv2.imwrite(os.path.join(view_dir, "summary.png"), summary)
+
+            # 每个视角保存自己的总结JSON
+            summary_data = {
+                "total_boxes": self.current_box_count,
+                "view_visible": len(view_visible_paths),
+                "view_tested": len(view_stable) + len(view_unstable),
+                "view_stable": len(view_stable),
+                "view_unstable": len(view_unstable)
+            }
+            with open(os.path.join(view_dir, "summary.json"), "w") as f:
+                json.dump(summary_data, f, indent=2)
+
+        # 统计本轮信息
+        round_time = time.time() - self.round_start_time
+        # 计算实际保存的样本数（每个视角只保存该视角可见的箱子）
+        round_samples = sum(
+            len([b for b in self.round_results if b["removed_box"]["prim_path"] in cam_data.get("visible_paths", set())])
+            for cam_data in self.camera_data.values()
+        )
+        self.total_samples += round_samples
+
+        print(f"[{self.round_index}/{self.total_rounds}] "
+              f"boxes={self.current_box_count}, tested={len(self.round_results)}, "
+              f"stable={len(stable)}, unstable={len(unstable)}, "
+              f"time={round_time:.1f}s")
 
     def run(self, num_rounds: int = 10):
         """运行采集"""
+        self.total_rounds = num_rounds
+        self.start_time = time.time()
+
         self.setup_scene()
         self.world.reset()
-        print(f"Starting collection for {num_rounds} rounds...")
+
+        start_round = self.round_index + 1
+        print(f"Dataset collection: rounds {start_round}-{num_rounds}, output={self.output_dir}")
 
         self.start_new_round()
         spawn_batch_index = 0
@@ -259,11 +573,11 @@ class DatasetCollector:
                 self.hold_timer += 1
                 if self.hold_timer >= self.hold_duration:
                     self.initial_scene_state = self.box_gen.save_scene_state()
-                    self.visible_boxes_to_test = self.camera.get_visible_boxes(self.box_gen)
+                    # capture_initial_state 会设置 self.visible_boxes_to_test（所有视角并集）
+                    self.capture_initial_state()
                     if not self.visible_boxes_to_test:
                         self.state = "ROUND_COMPLETE"
                     else:
-                        self.capture_initial_state()
                         self.current_test_index = 0
                         self.state = "TESTING"
 
@@ -275,12 +589,16 @@ class DatasetCollector:
                     self.removed_box_path = box["prim_path"]
                     self.stability_checker.snapshot_positions(self.box_gen)
                     self.box_gen.delete_box(self.removed_box_path)
-                    self.post_removal_timer = 0
+                    self.stability_checker.reset_convergence()
+                    self.wait_frame_count = 0
                     self.state = "WAITING_STABILITY"
 
             elif self.state == "WAITING_STABILITY":
-                self.post_removal_timer += 1
-                if self.post_removal_timer >= self.post_removal_wait:
+                self.wait_frame_count += 1
+                converged = self.stability_checker.check_converged(
+                    self.box_gen, min_stable_frames=10, excluded_path=self.removed_box_path
+                )
+                if converged or self.wait_frame_count >= self.max_wait_frames:
                     result = self.stability_checker.check(self.box_gen, self.removed_box_path)
                     box = self.visible_boxes_to_test[self.current_test_index]
                     self.save_removal_result(self.current_test_index, box, result)
@@ -289,14 +607,18 @@ class DatasetCollector:
                     self.current_test_index += 1
                     if self.current_test_index < len(self.visible_boxes_to_test):
                         self.box_gen.restore_scene_state(self.initial_scene_state)
-                        self.hold_timer = 0
+                        self.stability_checker.reset_convergence()
+                        self.wait_frame_count = 0
                         self.state = "RESTORING"
                     else:
                         self.state = "ROUND_COMPLETE"
 
             elif self.state == "RESTORING":
-                self.hold_timer += 1
-                if self.hold_timer >= 60:
+                self.wait_frame_count += 1
+                converged = self.stability_checker.check_converged(
+                    self.box_gen, min_stable_frames=5
+                )
+                if converged or self.wait_frame_count >= 120:
                     self.state = "TESTING"
 
             elif self.state == "ROUND_COMPLETE":
@@ -306,7 +628,8 @@ class DatasetCollector:
                     self.start_new_round()
                     spawn_batch_index = 0
                 else:
-                    print("All rounds complete!")
+                    total_time = time.time() - self.start_time
+                    print(f"\nComplete! samples={self.total_samples}, time={total_time/60:.1f}min")
                     break
 
         simulation_app.close()

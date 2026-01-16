@@ -5,6 +5,7 @@
 """
 
 import numpy as np
+from pathlib import Path
 from pxr import UsdGeom, UsdPhysics, Gf, Semantics, UsdShade, Sdf, PhysxSchema
 import omni.usd
 
@@ -12,9 +13,194 @@ import omni.usd
 class BoxGenerator:
     """纸箱生成器"""
 
-    def __init__(self):
+    def __init__(self, texture_dir: str = None):
         self._boxes = {}
         self._box_count = 0
+        self._textures = []
+
+        # 加载纹理文件列表
+        if texture_dir is None:
+            # 默认纹理目录
+            texture_dir = Path(__file__).parent.parent / "assets" / "cardboard_textures"
+        else:
+            texture_dir = Path(texture_dir)
+
+        if texture_dir.exists():
+            extensions = {'.jpg', '.jpeg', '.png'}
+            self._textures = sorted([
+                str(f.absolute()) for f in texture_dir.iterdir()
+                if f.suffix.lower() in extensions
+            ])
+
+    def _create_beveled_box_mesh(self, size: list, bevel_radius: float = 0.005):
+        """
+        创建带倒角的箱子网格数据
+
+        Args:
+            size: 箱子尺寸 [长, 宽, 高]
+            bevel_radius: 倒角半径 (单位：米，默认5mm)
+
+        Returns:
+            tuple: (points, normals, face_vertex_counts, face_vertex_indices, uvs, uv_indices)
+        """
+        # 半尺寸
+        hx, hy, hz = size[0] / 2, size[1] / 2, size[2] / 2
+        r = bevel_radius
+
+        # 内边界（倒角后的平面边界）
+        bx, by, bz = hx - r, hy - r, hz - r
+
+        # 24个顶点：每个角切成3个顶点
+        points = [
+            # 角0: (-x, -y, -z)
+            Gf.Vec3f(-bx, -hy, -hz),  # 0: 沿X方向
+            Gf.Vec3f(-hx, -by, -hz),  # 1: 沿Y方向
+            Gf.Vec3f(-hx, -hy, -bz),  # 2: 沿Z方向
+            # 角1: (+x, -y, -z)
+            Gf.Vec3f(bx, -hy, -hz),   # 3
+            Gf.Vec3f(hx, -by, -hz),   # 4
+            Gf.Vec3f(hx, -hy, -bz),   # 5
+            # 角2: (+x, +y, -z)
+            Gf.Vec3f(hx, by, -hz),    # 6
+            Gf.Vec3f(bx, hy, -hz),    # 7
+            Gf.Vec3f(hx, hy, -bz),    # 8
+            # 角3: (-x, +y, -z)
+            Gf.Vec3f(-bx, hy, -hz),   # 9
+            Gf.Vec3f(-hx, by, -hz),   # 10
+            Gf.Vec3f(-hx, hy, -bz),   # 11
+            # 角4: (-x, -y, +z)
+            Gf.Vec3f(-bx, -hy, hz),   # 12
+            Gf.Vec3f(-hx, -by, hz),   # 13
+            Gf.Vec3f(-hx, -hy, bz),   # 14
+            # 角5: (+x, -y, +z)
+            Gf.Vec3f(bx, -hy, hz),    # 15
+            Gf.Vec3f(hx, -by, hz),    # 16
+            Gf.Vec3f(hx, -hy, bz),    # 17
+            # 角6: (+x, +y, +z)
+            Gf.Vec3f(hx, by, hz),     # 18
+            Gf.Vec3f(bx, hy, hz),     # 19
+            Gf.Vec3f(hx, hy, bz),     # 20
+            # 角7: (-x, +y, +z)
+            Gf.Vec3f(-bx, hy, hz),    # 21
+            Gf.Vec3f(-hx, by, hz),    # 22
+            Gf.Vec3f(-hx, hy, bz),    # 23
+        ]
+
+        # 面定义（顶点索引，从外部看逆时针为正面）
+        faces = [
+            # 6个主面 (四边形) - 从外部看逆时针
+            [3, 7, 9, 0],       # 底面 -Z (从下往上看)
+            [12, 21, 19, 15],   # 顶面 +Z (从上往下看)
+            [1, 13, 14, 2],     # 左面 -X (从左往右看)
+            [16, 18, 6, 4],     # 右面 +X (从右往左看)
+            [13, 1, 4, 16],     # 前面 -Y (从前往后看)
+            [22, 23, 11, 10],   # 后面 +Y (从后往前看)
+
+            # 12条边的倒角面 (四边形)
+            # 底面Z-的4条边 (斜面朝外)
+            [1, 4, 3, 0],       # 底-前
+            [4, 6, 7, 3],       # 底-右
+            [6, 10, 9, 7],      # 底-后
+            [10, 1, 0, 9],      # 底-左
+            # 顶面Z+的4条边
+            [15, 16, 13, 12],   # 顶-前
+            [19, 18, 16, 15],   # 顶-右
+            [21, 22, 18, 19],   # 顶-后
+            [12, 13, 22, 21],   # 顶-左
+            # 竖直4条边
+            [14, 17, 5, 2],     # 前左 (-Y, -X)
+            [17, 20, 8, 5],     # 前右 (-Y, +X)
+            [20, 23, 11, 8],    # 后右 (+Y, +X)
+            [23, 14, 2, 11],    # 后左 (+Y, -X)
+
+            # 8个角的三角面 (朝外的小三角)
+            [2, 1, 0],          # 角0 (-x, -y, -z)
+            [4, 5, 3],          # 角1 (+x, -y, -z)
+            [8, 7, 6],          # 角2 (+x, +y, -z)
+            [10, 11, 9],        # 角3 (-x, +y, -z)
+            [13, 14, 12],       # 角4 (-x, -y, +z)
+            [17, 16, 15],       # 角5 (+x, -y, +z)
+            [19, 20, 18],       # 角6 (+x, +y, +z)
+            [23, 22, 21],       # 角7 (-x, +y, +z)
+        ]
+
+        face_vertex_counts = []
+        face_vertex_indices = []
+        for face in faces:
+            face_vertex_counts.append(len(face))
+            face_vertex_indices.extend(face)
+
+        # 计算法线（每个面一个法线）
+        normals = []
+        # 6个主面法线
+        main_normals = [
+            Gf.Vec3f(0, 0, -1),   # 底面 -Z
+            Gf.Vec3f(0, 0, 1),    # 顶面 +Z
+            Gf.Vec3f(-1, 0, 0),   # 左面 -X
+            Gf.Vec3f(1, 0, 0),    # 右面 +X
+            Gf.Vec3f(0, -1, 0),   # 前面 -Y
+            Gf.Vec3f(0, 1, 0),    # 后面 +Y
+        ]
+        # 12条边的倒角面法线（45度斜面）
+        sqrt2 = 0.7071
+        edge_normals = [
+            Gf.Vec3f(0, -sqrt2, -sqrt2),   # 底-前
+            Gf.Vec3f(sqrt2, 0, -sqrt2),    # 底-右
+            Gf.Vec3f(0, sqrt2, -sqrt2),    # 底-后
+            Gf.Vec3f(-sqrt2, 0, -sqrt2),   # 底-左
+            Gf.Vec3f(0, -sqrt2, sqrt2),    # 顶-前
+            Gf.Vec3f(sqrt2, 0, sqrt2),     # 顶-右
+            Gf.Vec3f(0, sqrt2, sqrt2),     # 顶-后
+            Gf.Vec3f(-sqrt2, 0, sqrt2),    # 顶-左
+            Gf.Vec3f(-sqrt2, -sqrt2, 0),   # 前左
+            Gf.Vec3f(sqrt2, -sqrt2, 0),    # 前右
+            Gf.Vec3f(sqrt2, sqrt2, 0),     # 后右
+            Gf.Vec3f(-sqrt2, sqrt2, 0),    # 后左
+        ]
+        # 8个角的法线（指向角的方向）
+        sqrt3 = 0.5774
+        corner_normals = [
+            Gf.Vec3f(-sqrt3, -sqrt3, -sqrt3),  # 角0
+            Gf.Vec3f(sqrt3, -sqrt3, -sqrt3),   # 角1
+            Gf.Vec3f(sqrt3, sqrt3, -sqrt3),    # 角2
+            Gf.Vec3f(-sqrt3, sqrt3, -sqrt3),   # 角3
+            Gf.Vec3f(-sqrt3, -sqrt3, sqrt3),   # 角4
+            Gf.Vec3f(sqrt3, -sqrt3, sqrt3),    # 角5
+            Gf.Vec3f(sqrt3, sqrt3, sqrt3),     # 角6
+            Gf.Vec3f(-sqrt3, sqrt3, sqrt3),    # 角7
+        ]
+
+        # 为每个面的每个顶点分配法线
+        for i, face in enumerate(faces):
+            if i < 6:
+                normal = main_normals[i]
+            elif i < 18:
+                normal = edge_normals[i - 6]
+            else:
+                normal = corner_normals[i - 18]
+            for _ in face:
+                normals.append(normal)
+
+        # UV坐标（faceVarying，每个面顶点独立UV）
+        uvs = []
+        uv_indices = []
+        uv_idx = 0
+        for face in faces:
+            n = len(face)
+            if n == 4:
+                uvs.extend([
+                    Gf.Vec2f(0, 0), Gf.Vec2f(1, 0),
+                    Gf.Vec2f(1, 1), Gf.Vec2f(0, 1)
+                ])
+            else:  # 三角形
+                uvs.extend([
+                    Gf.Vec2f(0, 0), Gf.Vec2f(1, 0), Gf.Vec2f(0.5, 1)
+                ])
+            for j in range(n):
+                uv_indices.append(uv_idx + j)
+            uv_idx += n
+
+        return points, normals, face_vertex_counts, face_vertex_indices, uvs, uv_indices
 
     def create_box(
         self,
@@ -22,7 +208,8 @@ class BoxGenerator:
         position: list = None,
         size: list = None,
         mass: float = 1.0,
-        color: list = None
+        color: list = None,
+        texture_path: str = None
     ) -> str:
         """
         创建一个纸箱
@@ -32,7 +219,8 @@ class BoxGenerator:
             position: 位置 [x, y, z]
             size: 尺寸 [长, 宽, 高]
             mass: 质量(kg)
-            color: RGBA颜色
+            color: RGBA颜色 (仅在无纹理时使用)
+            texture_path: 纹理图片路径
 
         Returns:
             str: 纸箱的prim路径
@@ -55,13 +243,29 @@ class BoxGenerator:
         xform = UsdGeom.Xform.Define(stage, prim_path)
         xform.AddTranslateOp().Set(Gf.Vec3d(*position))
 
-        # 创建立方体几何
-        cube_path = f"{prim_path}/geometry"
-        cube = UsdGeom.Cube.Define(stage, cube_path)
-        cube.GetSizeAttr().Set(1.0)
+        # 创建带倒角的网格几何（用于渲染）
+        mesh_path = f"{prim_path}/geometry"
+        mesh = UsdGeom.Mesh.Define(stage, mesh_path)
 
-        # 设置缩放以匹配尺寸
-        cube.AddScaleOp().Set(Gf.Vec3f(*size))
+        # 生成倒角网格数据
+        points, normals, face_counts, face_indices, uvs, uv_indices = \
+            self._create_beveled_box_mesh(size, bevel_radius=0.003)
+
+        # 设置网格属性
+        mesh.GetPointsAttr().Set(points)
+        mesh.GetFaceVertexCountsAttr().Set(face_counts)
+        mesh.GetFaceVertexIndicesAttr().Set(face_indices)
+
+        # 设置法线（faceVarying插值）
+        mesh.GetNormalsAttr().Set(normals)
+        mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
+
+        # 设置UV坐标
+        uv_primvar = UsdGeom.PrimvarsAPI(mesh.GetPrim()).CreatePrimvar(
+            "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying
+        )
+        uv_primvar.Set(uvs)
+        uv_primvar.SetIndices(uv_indices)
 
         # 创建粗糙纸箱材质
         mat_path = f"{prim_path}/material"
@@ -69,10 +273,37 @@ class BoxGenerator:
         shader = UsdShade.Shader.Define(stage, f"{mat_path}/shader")
         shader.CreateIdAttr("UsdPreviewSurface")
 
-        # 设置颜色
-        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
-            Gf.Vec3f(color[0], color[1], color[2])
-        )
+        # 如果有纹理，使用纹理贴图
+        if texture_path:
+            # 创建纹理采样器
+            tex_shader = UsdShade.Shader.Define(stage, f"{mat_path}/diffuse_texture")
+            tex_shader.CreateIdAttr("UsdUVTexture")
+            tex_shader.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(texture_path)
+            tex_shader.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("repeat")
+            tex_shader.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("repeat")
+            tex_shader.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+
+            # 创建UV读取器
+            uv_reader = UsdShade.Shader.Define(stage, f"{mat_path}/uv_reader")
+            uv_reader.CreateIdAttr("UsdPrimvarReader_float2")
+            uv_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+            uv_reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+
+            # 连接UV到纹理
+            tex_shader.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
+                uv_reader.ConnectableAPI(), "result"
+            )
+
+            # 连接纹理到shader的diffuseColor
+            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(
+                tex_shader.ConnectableAPI(), "rgb"
+            )
+        else:
+            # 无纹理时使用纯色
+            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+                Gf.Vec3f(color[0], color[1], color[2])
+            )
+
         # 设置粗糙度（0.8-1.0 很粗糙）
         shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.9)
         # 设置金属度（纸箱不是金属）
@@ -82,14 +313,22 @@ class BoxGenerator:
         material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
 
         # 绑定材质到几何体
-        UsdShade.MaterialBindingAPI(cube.GetPrim()).Bind(material)
+        UsdShade.MaterialBindingAPI(mesh.GetPrim()).Bind(material)
 
         # 添加刚体物理
         rigid_body = UsdPhysics.RigidBodyAPI.Apply(xform.GetPrim())
         rigid_body.CreateRigidBodyEnabledAttr(True)
 
-        # 添加碰撞
-        collision = UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+        # 创建独立的碰撞体（简单Box，不渲染）
+        collider_path = f"{prim_path}/collider"
+        collider = UsdGeom.Cube.Define(stage, collider_path)
+        collider.GetSizeAttr().Set(1.0)
+        collider.AddScaleOp().Set(Gf.Vec3f(*size))
+        # 隐藏碰撞体，不参与渲染
+        collider.GetPurposeAttr().Set(UsdGeom.Tokens.guide)
+
+        # 添加碰撞到独立的碰撞体
+        collision = UsdPhysics.CollisionAPI.Apply(collider.GetPrim())
 
         # 添加物理材质 - 高摩擦、低弹性，防止箱子弹开
         phys_mat_path = f"{prim_path}/physics_material"
@@ -100,8 +339,8 @@ class BoxGenerator:
         phys_mat.CreateRestitutionAttr(0.01)     # 极低弹性，几乎不反弹
 
         # 使用PhysxSchema绑定物理材质到碰撞体
-        physx_collision = PhysxSchema.PhysxCollisionAPI.Apply(cube.GetPrim())
-        collision_prim = cube.GetPrim()
+        physx_collision = PhysxSchema.PhysxCollisionAPI.Apply(collider.GetPrim())
+        collision_prim = collider.GetPrim()
         rel = collision_prim.CreateRelationship("material:binding:physics", False)
         rel.SetTargets([Sdf.Path(phys_mat_path)])
 
@@ -127,7 +366,6 @@ class BoxGenerator:
             "mass": mass
         }
 
-        print(f"Box created: {prim_path}")
         return prim_path
 
     def get_box_position(self, name: str) -> np.ndarray:
@@ -240,10 +478,14 @@ class BoxGenerator:
             # 记录本箱子位置和尺寸
             spawned_boxes.append(([pos_x, pos_y, pos_z], size))
 
-            # 随机纸箱颜色（黄褐色范围，更接近真实纸箱）
-            # 基础色调：黄褐色 (0.72, 0.53, 0.35)
+            # 随机选择纹理（如果有的话）
+            texture_path = None
+            if self._textures:
+                texture_path = np.random.choice(self._textures)
+
+            # 随机纸箱颜色（仅在无纹理时使用）
             base_r, base_g, base_b = 0.72, 0.53, 0.35
-            variation = 0.05  # 颜色波动范围
+            variation = 0.05
             color = [
                 base_r + np.random.uniform(-variation, variation),
                 base_g + np.random.uniform(-variation, variation),
@@ -251,16 +493,16 @@ class BoxGenerator:
                 1.0
             ]
 
-            # 创建纸箱（不传name，让create_box自动生成唯一名字）
+            # 创建纸箱
             path = self.create_box(
                 position=[pos_x, pos_y, pos_z],
                 size=size,
                 mass=mass,
-                color=color
+                color=color,
+                texture_path=texture_path
             )
             box_paths.append(path)
 
-        print(f"Created {count} random boxes dropping from height {drop_height}m")
         return box_paths
 
     def get_topmost_box(self, exclude_paths: list = None) -> tuple:
@@ -528,12 +770,10 @@ class BoxGenerator:
         prim = stage.GetPrimAtPath(prim_path)
 
         if not prim.IsValid():
-            print(f"Invalid prim path: {prim_path}")
             return False
 
         # 从stage中删除prim
         stage.RemovePrim(prim_path)
-        print(f"Deleted box: {prim_path}")
 
         # 从跟踪列表中移除
         for name, info in list(self._boxes.items()):
@@ -547,7 +787,6 @@ class BoxGenerator:
         """从跟踪列表中移除箱子（不删除物理对象）"""
         if name in self._boxes:
             del self._boxes[name]
-            print(f"Box {name} removed from tracking")
 
     def get_all_box_positions(self, exclude_paths: list = None) -> dict:
         """
@@ -606,7 +845,6 @@ class BoxGenerator:
                     "mass": info["mass"]
                 }
 
-        print(f"Saved scene state: {len(state)} boxes")
         return state
 
     def restore_scene_state(self, state: dict):
@@ -628,8 +866,6 @@ class BoxGenerator:
             else:
                 # 箱子存在，恢复位置
                 self._reset_box_transform(prim, box_state)
-
-        print(f"Restored scene state: {len(state)} boxes")
 
     def _recreate_box(self, name: str, box_state: dict):
         """重新创建被删除的箱子"""

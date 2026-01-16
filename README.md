@@ -2,15 +2,26 @@
 
 基于深度学习的纸箱堆叠稳定性预测系统。通过 Isaac Sim 仿真采集数据，训练神经网络预测移除某个箱子后堆叠结构是否会倒塌。
 
+## 系统概述
+
+本项目解决仓储物流中的核心问题：**预测移除某个纸箱后，堆叠结构是否会倒塌**。
+
+系统包含两个主要模块：
+1. **数据采集模块** - 基于 Isaac Sim 物理仿真，自动生成带标注的训练数据
+2. **稳定性预测模块** - 深度学习模型，从图像预测箱子移除后的稳定性
+
 ## 核心功能
 
-### 1. 仿真数据采集
+### 仿真数据采集
 - 基于 NVIDIA Isaac Sim 的物理仿真环境
+- 9 个视角同时采集（顶视图 + 8 个方向）
 - 自动生成随机纸箱堆叠场景
-- 循环测试每个可见箱子的移除稳定性
+- 随机光照、地面纹理增强泛化能力
 - 自动标注：稳定(1) / 不稳定(0)
 
-### 2. 稳定性预测模型
+> 详细数据采集文档请参考 [docs/DATA_COLLECTION.md](docs/DATA_COLLECTION.md)
+
+### 稳定性预测模型
 
 提供三种模型架构：
 
@@ -20,7 +31,7 @@
 | Two-Stream ResNet | `model_twostream.py` | 双流 ResNet，全局+局部视图 |
 | **Two-Stream ViT** | `model_vit_twostream.py` | 双流 ViT + Cross-Attention 融合 |
 
-### 3. ViT 双流网络架构 (推荐)
+### ViT 双流网络架构 (推荐)
 
 ```
 Global Stream (ViT)              Local Stream (ViT)
@@ -50,7 +61,7 @@ BoxWorld-MVP/
 │   ├── scene_builder.py    # 场景构建（地面、光源、纹理）
 │   ├── camera_manager.py   # 相机和标注器管理
 │   ├── stability_checker.py # 稳定性检测
-│   └── image_utils.py      # 图像处理工具
+│   └── image_utils.py      # 图像处理工具（噪声、投影计算）
 ├── src/
 │   └── box_generator.py    # 纸箱生成器
 ├── train/
@@ -126,22 +137,9 @@ python train.py
 | small | 384 | 12 | 6 | ~47M |
 | base | 768 | 12 | 12 | ~180M |
 
-## 数据集格式
+## 数据集
 
-```
-dataset/
-├── round_001/
-│   ├── initial/
-│   │   └── rgb.png           # 初始场景图像
-│   └── removals/
-│       ├── 00/
-│       │   ├── mask.png      # 目标箱子掩码
-│       │   └── result.json   # 稳定性标签
-│       ├── 01/
-│       ...
-├── round_002/
-...
-```
+数据集格式和采集逻辑的详细说明请参考 [docs/DATA_COLLECTION.md](docs/DATA_COLLECTION.md)。
 
 ## License
 

@@ -50,15 +50,13 @@ class CameraManager:
         self.rgb_annotator.attach([self.render_product])
 
         # 实例分割标注器
-        self.seg_annotator = rep.AnnotatorRegistry.get_annotator("instance_segmentation")
+        self.seg_annotator = rep.AnnotatorRegistry.get_annotator("instance_id_segmentation")
         self.seg_annotator.attach([self.render_product])
 
         # 深度标注器（可选）
         if with_depth:
             self.depth_annotator = rep.AnnotatorRegistry.get_annotator("distance_to_camera")
             self.depth_annotator.attach([self.render_product])
-
-        print(f"Camera created at {position}, resolution {resolution}")
 
     def get_rgb(self) -> np.ndarray:
         """获取RGB图像"""
@@ -93,7 +91,7 @@ class CameraManager:
             return mask, id_to_labels
         return None, None
 
-    def get_visible_boxes(self, box_gen, min_visible_ratio: float = 0.20) -> list:
+    def get_visible_boxes(self, box_gen, min_visible_ratio: float = 0.3) -> list:
         """获取所有可见箱子列表
 
         Args:
@@ -141,5 +139,4 @@ class CameraManager:
                     added_names.add(name)
                     break
 
-        print(f"Visible boxes: {len(visible_boxes)}")
         return visible_boxes

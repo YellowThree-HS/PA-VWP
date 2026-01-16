@@ -6,17 +6,68 @@ import numpy as np
 class StabilityChecker:
     """箱子稳定性检测器"""
 
-    def __init__(self, threshold: float = 0.02):
+    def __init__(self, threshold: float = 0.02, velocity_threshold: float = 0.005):
         """
         Args:
             threshold: 位移阈值（米），默认2cm
+            velocity_threshold: 速度收敛阈值（米/步），默认5mm/step
         """
         self.threshold = threshold
+        self.velocity_threshold = velocity_threshold
         self.positions_before = {}
+        # 动态收敛检测状态
+        self._last_positions = {}
+        self._stable_frames = 0
 
     def snapshot_positions(self, box_gen):
         """保存当前所有箱子位置快照"""
         self.positions_before = box_gen.get_all_box_positions()
+
+    def reset_convergence(self):
+        """重置收敛检测状态"""
+        self._last_positions = {}
+        self._stable_frames = 0
+
+    def check_converged(self, box_gen, min_stable_frames: int = 10,
+                        max_frames: int = 120, excluded_path: str = None) -> bool:
+        """
+        检测场景是否已收敛（所有箱子速度趋近于0）
+
+        Args:
+            box_gen: BoxGenerator实例
+            min_stable_frames: 连续稳定帧数阈值
+            max_frames: 最大等待帧数（超时保护）
+            excluded_path: 要排除的箱子路径
+
+        Returns:
+            bool: 是否已收敛
+        """
+        exclude_paths = [excluded_path] if excluded_path else []
+        current_positions = box_gen.get_all_box_positions(exclude_paths=exclude_paths)
+
+        # 首次调用，初始化
+        if not self._last_positions:
+            self._last_positions = current_positions
+            self._stable_frames = 0
+            return False
+
+        # 计算最大速度（位移/帧）
+        max_velocity = 0.0
+        for path, pos in current_positions.items():
+            if path in self._last_positions:
+                velocity = np.linalg.norm(pos - self._last_positions[path])
+                max_velocity = max(max_velocity, velocity)
+
+        # 更新位置记录
+        self._last_positions = current_positions
+
+        # 判断是否稳定
+        if max_velocity < self.velocity_threshold:
+            self._stable_frames += 1
+        else:
+            self._stable_frames = 0
+
+        return self._stable_frames >= min_stable_frames
 
     def check(self, box_gen, removed_path: str) -> dict:
         """检测移除箱子后的稳定性
