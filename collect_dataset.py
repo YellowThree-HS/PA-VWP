@@ -74,9 +74,9 @@ class DatasetCollector:
         self.box_paths = []
 
         # 时序控制
-        self.hold_duration = 120
+        self.hold_duration = 60  # 箱子生成后保持（1秒）
         self.hold_timer = 0
-        self.max_wait_frames = 240  # 最大等待帧数（约4秒@60FPS）
+        self.max_wait_frames = 180  # 初始环境稳定（3秒）
         self.wait_frame_count = 0
 
         # 采集相关
@@ -249,7 +249,7 @@ class DatasetCollector:
                 })
 
             # 判断是否可见
-            if expected_pixels > 0 and visibility_ratio >= min_visible_ratio and actual_pixels >= 200:
+            if expected_pixels > 0 and visibility_ratio >= min_visible_ratio and actual_pixels >= 300:
                 visible_paths.add(box_prim_path)
 
         return visible_paths
@@ -432,12 +432,18 @@ class DatasetCollector:
                         visible_mask[mask_data == box_id] = 255
                 cv2.imwrite(os.path.join(view_dir, "visible_mask.png"), visible_mask)
 
-            # 保存该视角可见箱子列表
-            view_visible_info = [
-                {"name": name, "prim_path": info["prim_path"]}
-                for name, info in self.box_gen.boxes.items()
-                if info["prim_path"] in view_visible_paths
-            ]
+            # 保存该视角可见箱子列表（含 bbox）
+            view_visible_info = []
+            for name, info in self.box_gen.boxes.items():
+                if info["prim_path"] in view_visible_paths:
+                    box_data = {"name": name, "prim_path": info["prim_path"]}
+                    # 计算 bbox
+                    box_id = ImageUtils.get_mask_id(info["prim_path"], id_to_labels)
+                    if box_id is not None and mask_data is not None:
+                        bbox = ImageUtils.get_bbox_from_mask(mask_data, box_id)
+                        if bbox:
+                            box_data["bbox"] = bbox
+                    view_visible_info.append(box_data)
             with open(os.path.join(view_dir, "visible_boxes.json"), "w") as f:
                 json.dump(view_visible_info, f, indent=2)
 
@@ -567,11 +573,15 @@ class DatasetCollector:
                         spawn_batch_index += 1
                         if spawn_batch_index >= len(self.box_spawn_steps):
                             self.state = "STABILIZING"
+                            self.stability_checker.reset_convergence()
                             self.hold_timer = 0
 
             elif self.state == "STABILIZING":
                 self.hold_timer += 1
-                if self.hold_timer >= self.hold_duration:
+                converged = self.stability_checker.check_converged(
+                    self.box_gen, min_stable_frames=30
+                )
+                if converged or self.hold_timer >= 300:  # 收敛或最多等5秒
                     self.initial_scene_state = self.box_gen.save_scene_state()
                     # capture_initial_state 会设置 self.visible_boxes_to_test（所有视角并集）
                     self.capture_initial_state()
@@ -596,9 +606,9 @@ class DatasetCollector:
             elif self.state == "WAITING_STABILITY":
                 self.wait_frame_count += 1
                 converged = self.stability_checker.check_converged(
-                    self.box_gen, min_stable_frames=10, excluded_path=self.removed_box_path
+                    self.box_gen, min_stable_frames=30, excluded_path=self.removed_box_path
                 )
-                if converged or self.wait_frame_count >= 120:  # 移除后等待2秒
+                if converged or self.wait_frame_count >= 120:  # 移除后最多等待2秒
                     result = self.stability_checker.check(self.box_gen, self.removed_box_path)
                     box = self.visible_boxes_to_test[self.current_test_index]
                     self.save_removal_result(self.current_test_index, box, result)
@@ -616,9 +626,9 @@ class DatasetCollector:
             elif self.state == "RESTORING":
                 self.wait_frame_count += 1
                 converged = self.stability_checker.check_converged(
-                    self.box_gen, min_stable_frames=5
+                    self.box_gen, min_stable_frames=30
                 )
-                if converged or self.wait_frame_count >= 120:
+                if converged or self.wait_frame_count >= 120:  # 恢复后最多等待2秒
                     self.state = "TESTING"
 
             elif self.state == "ROUND_COMPLETE":

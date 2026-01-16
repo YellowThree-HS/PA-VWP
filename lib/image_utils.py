@@ -183,6 +183,26 @@ class ImageUtils:
         return total_projected_area * (pixels_per_meter ** 2)
 
     @staticmethod
+    def get_bbox_from_mask(mask: np.ndarray, mask_id: int) -> dict:
+        """
+        从 mask 中计算指定 ID 的 bbox
+
+        Args:
+            mask: 分割掩码
+            mask_id: 目标 ID
+
+        Returns:
+            dict: {"x1": int, "y1": int, "x2": int, "y2": int} 或 None
+        """
+        binary_mask = (mask == mask_id).astype(np.uint8)
+        coords = np.where(binary_mask > 0)
+        if len(coords[0]) == 0:
+            return None
+        y1, y2 = int(coords[0].min()), int(coords[0].max())
+        x1, x2 = int(coords[1].min()), int(coords[1].max())
+        return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+
+    @staticmethod
     def create_summary_image(
         rgb_image: np.ndarray,
         mask_data: np.ndarray,
