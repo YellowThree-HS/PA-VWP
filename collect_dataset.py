@@ -16,13 +16,15 @@ import argparse
 parser = argparse.ArgumentParser(description="BoxWorld Dataset Collector")
 parser.add_argument("--rounds", type=int, default=10, help="Number of rounds")
 parser.add_argument("--output", type=str, default="dataset", help="Output dir")
-parser.add_argument("--headless", action="store_true", help="Run without visualization")
+parser.add_argument("--headless", action="store_true", default=True, help="Run without visualization")
+parser.add_argument("--gui", action="store_true", help="Run with visualization (override headless)")
 args = parser.parse_args()
 
 from isaacsim import SimulationApp
 
 # 启动仿真应用
-simulation_app = SimulationApp({"headless": args.headless})
+headless_mode = args.headless and not args.gui
+simulation_app = SimulationApp({"headless": headless_mode})
 
 import numpy as np
 import cv2
@@ -92,6 +94,28 @@ class DatasetCollector:
         self.rgb_annotator = None
         self.depth_annotator = None
         self.seg_annotator = None
+
+        # 检测已有轮次，从下一轮继续
+        self._detect_existing_rounds()
+
+    def _detect_existing_rounds(self):
+        """检测已有轮次数量，设置起始轮次"""
+        if not os.path.exists(self.output_dir):
+            return
+
+        max_round = 0
+        for name in os.listdir(self.output_dir):
+            if name.startswith("round_"):
+                try:
+                    # 格式: round_0001_63
+                    round_num = int(name.split("_")[1])
+                    max_round = max(max_round, round_num)
+                except (IndexError, ValueError):
+                    pass
+
+        if max_round > 0:
+            self.round_index = max_round
+            print(f"Found existing rounds, will continue from round {max_round + 1}")
 
     def _create_output_dirs(self):
         """创建输出目录结构（在知道箱子数量后调用）"""
