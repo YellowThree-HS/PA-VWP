@@ -44,7 +44,13 @@ Global Stream (ViT)              Local Stream (ViT)
 
 ```
 BoxWorld-MVP/
-├── main.py                 # Isaac Sim 仿真主脚本
+├── main.py                 # 可视化仿真脚本（带GUI）
+├── collect_dataset.py      # 数据集采集脚本（无头模式）
+├── lib/                    # 公共库模块
+│   ├── scene_builder.py    # 场景构建（地面、光源、纹理）
+│   ├── camera_manager.py   # 相机和标注器管理
+│   ├── stability_checker.py # 稳定性检测
+│   └── image_utils.py      # 图像处理工具
 ├── src/
 │   └── box_generator.py    # 纸箱生成器
 ├── train/
@@ -74,8 +80,14 @@ BoxWorld-MVP/
 ### 1. 数据采集
 
 ```bash
-# 运行仿真采集数据
+# 可视化模式（观察场景）
 python main.py
+
+# 无头模式批量采集（推荐）
+python collect_dataset.py --rounds 100 --output dataset
+
+# 带GUI的采集模式
+python collect_dataset.py --gui --rounds 10
 ```
 
 ### 2. 训练模型
