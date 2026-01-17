@@ -394,6 +394,135 @@ class BoxGenerator:
             return self._boxes[name]["prim_path"]
         return None
 
+    def create_neat_stacked_boxes(
+        self,
+        count: int = 10,
+        center: list = None,
+        base_size: tuple = (0.12, 0.10, 0.08),
+        size_variation: float = 0.02,
+        grid_spacing: float = 0.02,
+        max_layers: int = 5,
+        mass_range: tuple = (0.5, 2.0),
+        position_noise: float = 0.005,
+        rotation_noise: float = 3.0
+    ) -> list:
+        """
+        生成整齐堆叠的纸箱（类似仓库码垛）
+
+        Args:
+            count: 纸箱数量
+            center: 堆叠中心位置 [x, y]
+            base_size: 基础箱子尺寸 (长, 宽, 高)
+            size_variation: 尺寸随机变化范围
+            grid_spacing: 箱子之间的间距
+            max_layers: 最大堆叠层数
+            mass_range: 质量范围 (min, max)
+            position_noise: 位置微小偏移（模拟真实场景的不完美）
+            rotation_noise: 旋转微小偏移（度）
+
+        Returns:
+            list: 所有纸箱的prim路径列表
+        """
+        if center is None:
+            center = [0.45, 0.0]
+
+        box_paths = []
+
+        # 计算每层可以放多少个箱子
+        # 假设堆叠区域大小
+        area_size = 0.6  # 60cm x 60cm 区域
+
+        # 计算单个箱子占用的空间
+        box_footprint_x = base_size[0] + grid_spacing
+        box_footprint_y = base_size[1] + grid_spacing
+
+        # 每行/列可放置的箱子数
+        boxes_per_row = max(1, int(area_size / box_footprint_x))
+        boxes_per_col = max(1, int(area_size / box_footprint_y))
+        boxes_per_layer = boxes_per_row * boxes_per_col
+
+        # 计算需要多少层
+        num_layers = min(max_layers, (count + boxes_per_layer - 1) // boxes_per_layer)
+
+        # 起始位置（左下角）
+        start_x = center[0] - (boxes_per_row * box_footprint_x) / 2 + base_size[0] / 2
+        start_y = center[1] - (boxes_per_col * box_footprint_y) / 2 + base_size[1] / 2
+
+        box_index = 0
+        current_z = base_size[2] / 2 + 0.001  # 略高于地面
+
+        for layer in range(num_layers):
+            if box_index >= count:
+                break
+
+            for row in range(boxes_per_row):
+                if box_index >= count:
+                    break
+
+                for col in range(boxes_per_col):
+                    if box_index >= count:
+                        break
+
+                    # 计算基础位置
+                    pos_x = start_x + row * box_footprint_x
+                    pos_y = start_y + col * box_footprint_y
+                    pos_z = current_z
+
+                    # 添加微小位置噪声
+                    pos_x += np.random.uniform(-position_noise, position_noise)
+                    pos_y += np.random.uniform(-position_noise, position_noise)
+
+                    # 随机尺寸（微小变化）
+                    size = [
+                        base_size[0] + np.random.uniform(-size_variation, size_variation),
+                        base_size[1] + np.random.uniform(-size_variation, size_variation),
+                        base_size[2] + np.random.uniform(-size_variation, size_variation)
+                    ]
+
+                    # 随机质量
+                    mass = np.random.uniform(mass_range[0], mass_range[1])
+
+                    # 随机选择纹理
+                    texture_path = None
+                    if self._textures:
+                        texture_path = np.random.choice(self._textures)
+
+                    # 随机颜色（备用）
+                    base_r, base_g, base_b = 0.72, 0.53, 0.35
+                    variation = 0.05
+                    color = [
+                        base_r + np.random.uniform(-variation, variation),
+                        base_g + np.random.uniform(-variation, variation),
+                        base_b + np.random.uniform(-variation, variation),
+                        1.0
+                    ]
+
+                    # 创建纸箱
+                    path = self.create_box(
+                        position=[pos_x, pos_y, pos_z],
+                        size=size,
+                        mass=mass,
+                        color=color,
+                        texture_path=texture_path
+                    )
+
+                    # 添加微小旋转噪声
+                    if rotation_noise > 0:
+                        stage = omni.usd.get_context().get_stage()
+                        prim = stage.GetPrimAtPath(path)
+                        if prim.IsValid():
+                            xformable = UsdGeom.Xformable(prim)
+                            rot_z = np.random.uniform(-rotation_noise, rotation_noise)
+                            xformable.AddRotateZOp().Set(rot_z)
+
+                    box_paths.append(path)
+                    box_index += 1
+
+            # 下一层的高度
+            current_z += base_size[2] + 0.002  # 层间微小间隙
+
+        return box_paths
+
     def create_random_boxes(
         self,
         count: int = 10,

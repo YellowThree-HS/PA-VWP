@@ -7,10 +7,14 @@ import argparse
 
 # 解析参数（必须在SimulationApp之前）
 parser = argparse.ArgumentParser(description="BoxWorld Dataset Collector")
-parser.add_argument("--rounds", type=int, default=10, help="Number of rounds")
+parser.add_argument("--rounds", type=int, default=100, help="Number of rounds")
 parser.add_argument("--output", type=str, default="dataset", help="Output dir")
 parser.add_argument("--headless", action="store_true", default=True)
 parser.add_argument("--gui", action="store_true", help="Run with GUI")
+parser.add_argument("--mode", type=str, default="messy", choices=["messy", "neat"],
+                    help="Dataset mode: 'messy' (random drop) or 'neat' (stacked)")
+parser.add_argument("--min-boxes", type=int, default=30, help="Min boxes per round")
+parser.add_argument("--max-boxes", type=int, default=100, help="Max boxes per round")
 args = parser.parse_args()
 
 from isaacsim import SimulationApp
@@ -35,23 +39,25 @@ from box_generator import BoxGenerator
 from lib import CameraManager, StabilityChecker, ImageUtils, SceneBuilder
 
 # 九相机配置：八个方向 + 正上方
+# vertical_flip: 是否垂直翻转图像（解决某些视角图像颠倒问题）
 MULTI_CAMERA_CONFIGS = {
-    "top": {"position": (0.45, 0.0, 1.5), "rotation": (0, 0, 180)},
-    "north": {"position": (0.45, 1.0, 1.5), "rotation": (-30, 0, 0)},
-    "south": {"position": (0.45, -1.0, 1.5), "rotation": (-30, 0, 180)},
-    "east": {"position": (1.45, 0.0, 1.5), "rotation": (-30, 0, -90)},
-    "west": {"position": (-0.55, 0.0, 1.5), "rotation": (-30, 0, 90)},
-    "northeast": {"position": (1.15, 0.70, 1.5), "rotation": (-30, 0, -45)},
-    "northwest": {"position": (-0.25, 0.70, 1.5), "rotation": (-30, 0, 45)},
-    "southeast": {"position": (1.15, -0.70, 1.5), "rotation": (-30, 0, -135)},
-    "southwest": {"position": (-0.25, -0.70, 1.5), "rotation": (-30, 0, 135)},
+    "top": {"position": (0.45, 0.0, 1.5), "rotation": (0, 0, 180), "vertical_flip": True},
+    "north": {"position": (0.45, 1.0, 1.5), "rotation": (-30, 0, 0), "vertical_flip": True},
+    "south": {"position": (0.45, -1.0, 1.5), "rotation": (-30, 0, 180), "vertical_flip": True},
+    "east": {"position": (1.45, 0.0, 1.5), "rotation": (-30, 0, -90), "vertical_flip": True},
+    "west": {"position": (-0.55, 0.0, 1.5), "rotation": (-30, 0, 90), "vertical_flip": True},
+    "northeast": {"position": (1.15, 0.70, 1.5), "rotation": (-30, 0, -45), "vertical_flip": True},
+    "northwest": {"position": (-0.25, 0.70, 1.5), "rotation": (-30, 0, 45), "vertical_flip": True},
+    "southeast": {"position": (1.15, -0.70, 1.5), "rotation": (-30, 0, -135), "vertical_flip": True},
+    "southwest": {"position": (-0.25, -0.70, 1.5), "rotation": (-30, 0, 135), "vertical_flip": True},
 }
 
 
 class DatasetCollector:
     """数据集采集器（无头模式）- 每个round保存9组数据（9个视角）"""
 
-    def __init__(self, output_dir: str = "dataset"):
+    def __init__(self, output_dir: str = "dataset", mode: str = "messy",
+                 min_boxes: int = 30, max_boxes: int = 100):
         self.world = None
         self.box_gen = None
         self.scene_builder = SceneBuilder()
@@ -61,14 +67,15 @@ class DatasetCollector:
 
         self.output_dir = output_dir
         self.current_round_base_dir = None  # round基础目录
+        self.mode = mode  # "messy" 或 "neat"
 
         # 状态机
         self.state = "INIT"
         self.step_count = 0
 
         # 箱子参数
-        self.min_boxes = 30
-        self.max_boxes = 100
+        self.min_boxes = min_boxes
+        self.max_boxes = max_boxes
         self.current_box_count = 0
         self.box_spawn_steps = []
         self.box_paths = []
@@ -155,6 +162,7 @@ class DatasetCollector:
                 "rgb_annotator": rgb_annotator,
                 "depth_annotator": depth_annotator,
                 "seg_annotator": seg_annotator,
+                "vertical_flip": config.get("vertical_flip", False),
             }
 
     def get_visible_boxes_for_view(self, view_name: str, min_visible_ratio: float = 0.2, collect_stats: bool = False) -> set:
@@ -316,9 +324,10 @@ class DatasetCollector:
         self.randomize_lighting()
         self.scene_builder.randomize_floor_texture()
 
-        # 基础目录名（不含视角后缀）
+        # 基础目录名（不含视角后缀），包含模式标识
+        mode_suffix = "neat" if self.mode == "neat" else "messy"
         self.current_round_base_dir = os.path.join(
-            self.output_dir, f"round_{self.round_index:03d}_{self.current_box_count}"
+            self.output_dir, f"round_{self.round_index:03d}_{self.current_box_count}_{mode_suffix}"
         )
 
         # 为每个视角创建目录
@@ -326,11 +335,15 @@ class DatasetCollector:
             view_dir = f"{self.current_round_base_dir}_{view_name}"
             os.makedirs(view_dir, exist_ok=True)
 
-        # 计算分批生成
-        batch_size = self.current_box_count // 3
-        remainder = self.current_box_count % 3
-        batches = [batch_size + (1 if i < remainder else 0) for i in range(3)]
-        self.box_spawn_steps = [(20, batches[0]), (80, batches[1]), (140, batches[2])]
+        if self.mode == "neat":
+            # 整齐模式：一次性生成所有箱子，不需要分批
+            self.box_spawn_steps = [(20, self.current_box_count)]
+        else:
+            # 散乱模式：分批掉落
+            batch_size = self.current_box_count // 3
+            remainder = self.current_box_count % 3
+            batches = [batch_size + (1 if i < remainder else 0) for i in range(3)]
+            self.box_spawn_steps = [(20, batches[0]), (80, batches[1]), (140, batches[2])]
 
         # 重置状态
         self.box_paths = []
@@ -345,14 +358,29 @@ class DatasetCollector:
 
     def spawn_boxes(self, count: int):
         """生成箱子"""
-        paths = self.box_gen.create_random_boxes(
-            count=count,
-            center=[0.45, 0.0],
-            spread=0.15,
-            drop_height=0.30,
-            size_range=((0.05, 0.20), (0.05, 0.20), (0.05, 0.20)),
-            mass_range=(0.3, 1.5)
-        )
+        if self.mode == "neat":
+            # 整齐堆叠模式
+            paths = self.box_gen.create_neat_stacked_boxes(
+                count=count,
+                center=[0.45, 0.0],
+                base_size=(0.12, 0.10, 0.08),
+                size_variation=0.025,
+                grid_spacing=0.02,
+                max_layers=6,
+                mass_range=(0.3, 1.5),
+                position_noise=0.01,
+                rotation_noise=5.0
+            )
+        else:
+            # 散乱掉落模式
+            paths = self.box_gen.create_random_boxes(
+                count=count,
+                center=[0.45, 0.0],
+                spread=0.15,
+                drop_height=0.30,
+                size_range=((0.05, 0.20), (0.05, 0.20), (0.05, 0.20)),
+                mass_range=(0.3, 1.5)
+            )
         self.box_paths.extend(paths)
 
     def clear_scene(self):
@@ -367,19 +395,28 @@ class DatasetCollector:
         """捕获初始状态 - 为每个视角保存RGB、depth、mask，并记录各视角可见箱子"""
         for view_name, cam_info in self.multi_cameras.items():
             view_dir = f"{self.current_round_base_dir}_{view_name}"
+            vertical_flip = cam_info.get("vertical_flip", False)
 
             # 获取RGB
             rgb_annotator = cam_info["rgb_annotator"]
             rgb_data = rgb_annotator.get_data()
             rgb = rgb_data[:, :, :3].copy() if rgb_data is not None else None
+            if rgb is not None and vertical_flip:
+                rgb = cv2.flip(rgb, 0)
 
             # 获取depth和mask
             depth_data = cam_info["depth_annotator"].get_data() if "depth_annotator" in cam_info else None
+            # depth与RGB同步翻转，保持空间对齐
+            if depth_data is not None and vertical_flip:
+                depth_data = np.flip(depth_data, axis=0)
             mask_data, id_to_labels = None, {}
             if "seg_annotator" in cam_info:
                 seg_data = cam_info["seg_annotator"].get_data()
                 if seg_data is not None:
-                    mask_data = seg_data["data"]
+                    mask_data = seg_data["data"].copy()
+                    # mask与RGB同步翻转，保证标注对齐
+                    if mask_data is not None and vertical_flip:
+                        mask_data = np.flip(mask_data, axis=0)
                     id_to_labels = seg_data.get("info", {}).get("idToLabels", {})
 
             # 存储到camera_data
@@ -556,7 +593,8 @@ class DatasetCollector:
         self.world.reset()
 
         start_round = self.round_index + 1
-        print(f"Dataset collection: rounds {start_round}-{num_rounds}, output={self.output_dir}")
+        mode_desc = "neat (stacked)" if self.mode == "neat" else "messy (random drop)"
+        print(f"Dataset collection: mode={mode_desc}, rounds {start_round}-{num_rounds}, output={self.output_dir}")
 
         self.start_new_round()
         spawn_batch_index = 0
@@ -646,5 +684,10 @@ class DatasetCollector:
 
 
 if __name__ == "__main__":
-    collector = DatasetCollector(output_dir=args.output)
+    collector = DatasetCollector(
+        output_dir=args.output,
+        mode=args.mode,
+        min_boxes=args.min_boxes,
+        max_boxes=args.max_boxes
+    )
     collector.run(num_rounds=args.rounds)

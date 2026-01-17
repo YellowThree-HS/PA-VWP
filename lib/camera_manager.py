@@ -1,6 +1,7 @@
 """相机和标注器管理模块"""
 
 import numpy as np
+import cv2
 from pxr import UsdGeom, Gf
 import omni.usd
 import omni.replicator.core as rep
@@ -14,6 +15,7 @@ class CameraManager:
         self.rgb_annotator = None
         self.depth_annotator = None
         self.seg_annotator = None
+        self.vertical_flip = False
 
     def create_top_camera(
         self,
@@ -21,7 +23,8 @@ class CameraManager:
         rotation: tuple = (0, 0, 180),
         focal_length: float = 18.0,
         resolution: tuple = (640, 480),
-        with_depth: bool = False
+        with_depth: bool = False,
+        vertical_flip: bool = False
     ):
         """创建顶部相机并设置标注器
 
@@ -31,7 +34,9 @@ class CameraManager:
             focal_length: 焦距
             resolution: 分辨率 (width, height)
             with_depth: 是否启用深度标注器
+            vertical_flip: 是否垂直翻转图像（解决相机倒挂导致的图像颠倒）
         """
+        self.vertical_flip = vertical_flip
         stage = omni.usd.get_context().get_stage()
 
         # 创建相机
@@ -59,12 +64,15 @@ class CameraManager:
             self.depth_annotator.attach([self.render_product])
 
     def get_rgb(self) -> np.ndarray:
-        """获取RGB图像"""
+        """获取RGB图像（自动应用垂直翻转如果设置了的话）"""
         if self.rgb_annotator is None:
             return None
         data = self.rgb_annotator.get_data()
         if data is not None:
-            return data[:, :, :3].copy()
+            img = data[:, :, :3].copy()
+            if getattr(self, 'vertical_flip', False):
+                img = cv2.flip(img, 0)
+            return img
         return None
 
     def get_depth(self) -> np.ndarray:
