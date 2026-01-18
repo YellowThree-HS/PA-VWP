@@ -1,150 +1,469 @@
 """
-BoxWorld 稳定性预测模型训练脚本
+TransUNet 训练脚本
+
+用法:
+    python train.py --config default
+    python train.py --config debug
+    python train.py --config base --epochs 200 --lr 1e-4
 """
 
-import os
 import argparse
+import os
+import sys
+from pathlib import Path
+from typing import Dict, Optional
+
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
-from dataset import BoxStabilityDataset
-from model import StabilityPredictor
+# 添加项目根目录到路径
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from train.config import Config, get_config
+from train.dataset import BoxWorldDataset, create_dataloaders, get_train_transform, get_val_transform
+from train.models import TransUNet, TransUNetConfig
+from train.models.transunet import transunet_base, transunet_small, transunet_tiny
+from train.utils import (
+    set_seed,
+    get_device,
+    CombinedLoss,
+    MetricCalculator,
+    create_optimizer,
+    create_scheduler,
+    save_checkpoint,
+    load_checkpoint,
+    AverageMeter,
+    ProgressLogger,
+    EarlyStopping,
+)
 
 
-def train_epoch(model, loader, criterion, optimizer, device):
-    """训练一个epoch"""
+def create_model(config: Config, device: torch.device) -> nn.Module:
+    """创建模型"""
+    model_config = config.model
+    
+    if model_config.variant == 'tiny':
+        model = transunet_tiny(
+            pretrained=model_config.pretrained,
+            img_height=config.data.img_height,
+            img_width=config.data.img_width,
+            dropout=model_config.dropout,
+        )
+    elif model_config.variant == 'small':
+        model = transunet_small(
+            pretrained=model_config.pretrained,
+            img_height=config.data.img_height,
+            img_width=config.data.img_width,
+            dropout=model_config.dropout,
+        )
+    elif model_config.variant == 'base':
+        model = transunet_base(
+            pretrained=model_config.pretrained,
+            img_height=config.data.img_height,
+            img_width=config.data.img_width,
+            dropout=model_config.dropout,
+        )
+    else:
+        # 自定义配置
+        transunet_config = TransUNetConfig(
+            img_height=config.data.img_height,
+            img_width=config.data.img_width,
+            pretrained=model_config.pretrained,
+            hidden_dim=model_config.hidden_dim,
+            num_heads=model_config.num_heads,
+            num_layers=model_config.num_layers,
+            mlp_dim=model_config.mlp_dim,
+            dropout=model_config.dropout,
+        )
+        model = TransUNet(transunet_config)
+        
+    model = model.to(device)
+    
+    # 打印模型信息
+    n_params = model.get_num_params() / 1e6
+    n_total_params = model.get_num_params(trainable_only=False) / 1e6
+    print(f"模型: TransUNet-{model_config.variant}")
+    print(f"可训练参数: {n_params:.2f}M")
+    print(f"总参数: {n_total_params:.2f}M")
+    
+    return model
+
+
+def train_one_epoch(
+    model: nn.Module,
+    train_loader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    config: Config,
+    scaler: Optional[GradScaler] = None,
+    epoch: int = 0,
+) -> Dict[str, float]:
+    """训练一个 epoch"""
     model.train()
-    total_loss = 0
-    correct = 0
-    total = 0
-
-    pbar = tqdm(loader, desc="Training")
-    for inputs, labels in pbar:
-        inputs = inputs.to(device)
-        labels = labels.to(device).unsqueeze(1)
-
+    
+    metric_calc = MetricCalculator()
+    loss_meter = AverageMeter('loss')
+    cls_loss_meter = AverageMeter('cls_loss')
+    seg_loss_meter = AverageMeter('seg_loss')
+    
+    pbar = tqdm(train_loader, desc=f'Epoch {epoch} [Train]', leave=False)
+    
+    for batch_idx, batch in enumerate(pbar):
+        # 准备数据
+        inputs = batch['input'].to(device)
+        cls_targets = batch['stability_label'].to(device)
+        seg_targets = batch['affected_mask'].to(device)
+        
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+        
+        # 前向传播 (混合精度)
+        if config.train.use_amp and scaler is not None:
+            with autocast():
+                cls_logits, seg_logits = model(inputs)
+                loss, loss_dict = criterion(cls_logits, seg_logits, cls_targets, seg_targets)
+        else:
+            cls_logits, seg_logits = model(inputs)
+            loss, loss_dict = criterion(cls_logits, seg_logits, cls_targets, seg_targets)
+            
+        # 反向传播
+        if config.train.use_amp and scaler is not None:
+            scaler.scale(loss).backward()
+            
+            if config.train.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_clip)
+                
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            
+            if config.train.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_clip)
+                
+            optimizer.step()
+            
+        # 更新指标
+        batch_size = inputs.size(0)
+        loss_meter.update(loss_dict['total_loss'], batch_size)
+        cls_loss_meter.update(loss_dict['cls_loss'], batch_size)
+        seg_loss_meter.update(loss_dict['seg_loss'], batch_size)
+        
+        metric_calc.update(cls_logits, seg_logits, cls_targets, seg_targets)
+        
+        # 更新进度条
+        pbar.set_postfix({
+            'loss': f'{loss_meter.avg:.4f}',
+            'cls': f'{cls_loss_meter.avg:.4f}',
+            'seg': f'{seg_loss_meter.avg:.4f}',
+        })
+        
+    # 计算 epoch 指标
+    metrics = metric_calc.compute()
+    metrics['loss'] = loss_meter.avg
+    metrics['cls_loss'] = cls_loss_meter.avg
+    metrics['seg_loss'] = seg_loss_meter.avg
+    
+    return metrics
 
-        total_loss += loss.item()
-        preds = (outputs > 0.5).float()
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
 
-        pbar.set_postfix(loss=loss.item(), acc=correct/total)
-
-    return total_loss / len(loader), correct / total
-
-
-def validate(model, loader, criterion, device):
+@torch.no_grad()
+def validate(
+    model: nn.Module,
+    val_loader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    config: Config,
+) -> Dict[str, float]:
     """验证"""
     model.eval()
-    total_loss = 0
-    correct = 0
-    total = 0
+    
+    metric_calc = MetricCalculator()
+    loss_meter = AverageMeter('loss')
+    cls_loss_meter = AverageMeter('cls_loss')
+    seg_loss_meter = AverageMeter('seg_loss')
+    
+    pbar = tqdm(val_loader, desc='[Validate]', leave=False)
+    
+    for batch in pbar:
+        inputs = batch['input'].to(device)
+        cls_targets = batch['stability_label'].to(device)
+        seg_targets = batch['affected_mask'].to(device)
+        
+        # 前向传播
+        cls_logits, seg_logits = model(inputs)
+        loss, loss_dict = criterion(cls_logits, seg_logits, cls_targets, seg_targets)
+        
+        # 更新指标
+        batch_size = inputs.size(0)
+        loss_meter.update(loss_dict['total_loss'], batch_size)
+        cls_loss_meter.update(loss_dict['cls_loss'], batch_size)
+        seg_loss_meter.update(loss_dict['seg_loss'], batch_size)
+        
+        metric_calc.update(cls_logits, seg_logits, cls_targets, seg_targets)
+        
+    # 计算指标
+    metrics = metric_calc.compute()
+    metrics['loss'] = loss_meter.avg
+    metrics['cls_loss'] = cls_loss_meter.avg
+    metrics['seg_loss'] = seg_loss_meter.avg
+    
+    return metrics
 
-    with torch.no_grad():
-        for inputs, labels in tqdm(loader, desc="Validating"):
-            inputs = inputs.to(device)
-            labels = labels.to(device).unsqueeze(1)
 
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-
-            total_loss += loss.item()
-            preds = (outputs > 0.5).float()
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
-
-    return total_loss / len(loader), correct / total
-
-
-def main(args):
-    """主函数"""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # 创建数据集
-    dataset = BoxStabilityDataset(args.data_dir, image_size=args.image_size)
-
-    # 划分训练集和验证集
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-    print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
-
-    # DataLoader
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4
+def train(config: Config):
+    """主训练函数"""
+    # 设置随机种子
+    set_seed(config.train.seed)
+    
+    # 获取设备
+    device = get_device(config.device)
+    
+    # 创建数据加载器
+    print("\n" + "=" * 60)
+    print("加载数据...")
+    print("=" * 60)
+    
+    train_loader, val_loader = create_dataloaders(
+        train_dirs=config.data.train_dirs,
+        val_dirs=config.data.val_dirs,
+        batch_size=config.data.batch_size,
+        num_workers=config.data.num_workers,
+        img_size=(config.data.img_height, config.data.img_width),
+        val_split=config.data.val_split,
+        use_weighted_sampler=config.data.use_weighted_sampler,
+        seed=config.train.seed,
     )
-    val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4
-    )
-
+    
+    print(f"训练批次数: {len(train_loader)}")
+    print(f"验证批次数: {len(val_loader)}")
+    
     # 创建模型
-    model = StabilityPredictor(pretrained=True).to(device)
-
-    # 损失函数和优化器
-    criterion = nn.BCELoss()
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
-
-    # 创建输出目录
-    os.makedirs(args.output_dir, exist_ok=True)
-    best_acc = 0
-
-    # TensorBoard
-    writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "logs"))
-
-    # 训练循环
-    for epoch in range(args.epochs):
-        print(f"\nEpoch {epoch+1}/{args.epochs}")
-
-        train_loss, train_acc = train_epoch(
-            model, train_loader, criterion, optimizer, device
+    print("\n" + "=" * 60)
+    print("创建模型...")
+    print("=" * 60)
+    
+    model = create_model(config, device)
+    
+    # 创建损失函数
+    criterion = CombinedLoss(
+        cls_loss=config.loss.cls_loss,
+        seg_loss=config.loss.seg_loss,
+        cls_weight=config.model.cls_weight,
+        seg_weight=config.model.seg_weight,
+        pos_weight=config.loss.pos_weight,
+        focal_gamma=config.loss.focal_gamma,
+        focal_alpha=config.loss.focal_alpha,
+        dice_smooth=config.loss.dice_smooth,
+    )
+    criterion.cls_criterion = criterion.cls_criterion.to(device)
+    
+    # 创建优化器和调度器
+    optimizer = create_optimizer(model, config)
+    scheduler = create_scheduler(optimizer, config)
+    
+    # 混合精度训练
+    scaler = GradScaler() if config.train.use_amp else None
+    
+    # 早停
+    early_stopping = EarlyStopping(
+        patience=config.train.early_stopping_patience,
+        mode='max',  # 监控 F1 score
+    )
+    
+    # 检查点目录
+    save_dir = Path(config.train.save_dir) / config.exp_name
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 恢复训练
+    start_epoch = 1
+    resumed_best_f1 = 0.0
+    if hasattr(config, 'resume_path') and config.resume_path:
+        print(f"\n从检查点恢复: {config.resume_path}")
+        checkpoint = load_checkpoint(
+            model, config.resume_path, optimizer, scheduler, config.device
         )
-        val_loss, val_acc = validate(model, loader=val_loader, criterion=criterion, device=device)
+        start_epoch = checkpoint.get('epoch', 0) + 1
+        if 'metrics' in checkpoint and 'val' in checkpoint['metrics']:
+            resumed_best_f1 = checkpoint['metrics']['val'].get('cls_f1', 0.0)
+            print(f"恢复到 epoch {start_epoch - 1}, 之前最佳 F1: {resumed_best_f1:.4f}")
+    
+    # WandB 日志
+    if config.train.use_wandb:
+        try:
+            import wandb
+            wandb.init(
+                project=config.train.wandb_project,
+                name=config.train.wandb_run_name or config.exp_name,
+                config={
+                    'data': config.data.__dict__,
+                    'model': config.model.__dict__,
+                    'train': config.train.__dict__,
+                    'loss': config.loss.__dict__,
+                },
+            )
+        except ImportError:
+            print("警告: wandb 未安装，跳过日志记录")
+            config.train.use_wandb = False
+            
+    # 训练循环
+    print("\n" + "=" * 60)
+    print("开始训练...")
+    print("=" * 60)
+    
+    best_f1 = resumed_best_f1
+    best_epoch = start_epoch - 1 if resumed_best_f1 > 0 else 0
+    
+    for epoch in range(start_epoch, config.train.epochs + 1):
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"\nEpoch {epoch}/{config.train.epochs} (lr: {current_lr:.2e})")
+        
+        # 训练
+        train_metrics = train_one_epoch(
+            model, train_loader, criterion, optimizer, device,
+            config, scaler, epoch
+        )
+        
+        # 验证
+        val_metrics = validate(model, val_loader, criterion, device, config)
+        
+        # 更新学习率
+        if config.train.scheduler == 'plateau':
+            scheduler.step(val_metrics['loss'])
+        else:
+            scheduler.step()
+            
+        # 打印结果
+        print(f"\n训练: loss={train_metrics['loss']:.4f}, "
+              f"acc={train_metrics['cls_accuracy']:.4f}, "
+              f"f1={train_metrics['cls_f1']:.4f}, "
+              f"iou={train_metrics['seg_iou']:.4f}")
+        print(f"验证: loss={val_metrics['loss']:.4f}, "
+              f"acc={val_metrics['cls_accuracy']:.4f}, "
+              f"f1={val_metrics['cls_f1']:.4f}, "
+              f"iou={val_metrics['seg_iou']:.4f}")
+        
+        # WandB 日志
+        if config.train.use_wandb:
+            import wandb
+            wandb.log({
+                'epoch': epoch,
+                'lr': current_lr,
+                **{f'train/{k}': v for k, v in train_metrics.items()},
+                **{f'val/{k}': v for k, v in val_metrics.items()},
+            })
+            
+        # 保存检查点
+        is_best = val_metrics['cls_f1'] > best_f1
+        if is_best:
+            best_f1 = val_metrics['cls_f1']
+            best_epoch = epoch
+            
+        if is_best or (epoch % config.train.save_freq == 0):
+            checkpoint_path = save_dir / f'checkpoint_epoch_{epoch}.pth'
+            save_checkpoint(
+                model, optimizer, scheduler, epoch,
+                {'train': train_metrics, 'val': val_metrics},
+                str(checkpoint_path),
+                is_best=is_best,
+            )
+            if is_best:
+                print(f"  ✓ 保存最佳模型 (F1: {best_f1:.4f})")
+                
+        # 早停检查
+        if early_stopping(val_metrics['cls_f1']):
+            print(f"\n早停触发! 最佳 epoch: {best_epoch}, 最佳 F1: {best_f1:.4f}")
+            break
+            
+    print("\n" + "=" * 60)
+    print(f"训练完成! 最佳验证 F1: {best_f1:.4f} (Epoch {best_epoch})")
+    print(f"模型保存于: {save_dir}")
+    print("=" * 60)
+    
+    if config.train.use_wandb:
+        import wandb
+        wandb.finish()
+        
+    return best_f1
 
-        scheduler.step()
 
-        print(f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
-        print(f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='TransUNet 训练脚本')
+    
+    # 配置预设
+    parser.add_argument('--config', type=str, default='default',
+                        choices=['default', 'debug', 'small', 'base', 'full_data'],
+                        help='配置预设')
+    
+    # 覆盖参数
+    parser.add_argument('--exp_name', type=str, default=None, help='实验名称')
+    parser.add_argument('--data_dirs', type=str, nargs='+', default=None, help='数据目录')
+    parser.add_argument('--batch_size', type=int, default=None, help='批次大小')
+    parser.add_argument('--epochs', type=int, default=None, help='训练轮数')
+    parser.add_argument('--lr', type=float, default=None, help='学习率')
+    parser.add_argument('--model', type=str, default=None, 
+                        choices=['tiny', 'small', 'base'], help='模型变体')
+    parser.add_argument('--device', type=str, default=None, help='设备 (cuda/cpu)')
+    parser.add_argument('--num_workers', type=int, default=None, help='数据加载线程数')
+    parser.add_argument('--resume', type=str, default=None, help='恢复训练的检查点路径')
+    parser.add_argument('--wandb', action='store_true', help='启用 WandB 日志')
+    parser.add_argument('--no_amp', action='store_true', help='禁用混合精度训练')
+    
+    return parser.parse_args()
 
-        # TensorBoard 记录
-        writer.add_scalar("Loss/train", train_loss, epoch)
-        writer.add_scalar("Loss/val", val_loss, epoch)
-        writer.add_scalar("Accuracy/train", train_acc, epoch)
-        writer.add_scalar("Accuracy/val", val_acc, epoch)
-        writer.add_scalar("LR", scheduler.get_last_lr()[0], epoch)
 
-        # 保存最佳模型
-        if val_acc > best_acc:
-            best_acc = val_acc
-            torch.save(model.state_dict(), os.path.join(args.output_dir, "best.pth"))
-            print(f"Saved best model with acc: {best_acc:.4f}")
+def main():
+    """主函数"""
+    args = parse_args()
+    
+    # 加载配置
+    config = get_config(args.config)
+    
+    # 覆盖配置
+    if args.exp_name:
+        config.exp_name = args.exp_name
+    if args.data_dirs:
+        config.data.train_dirs = args.data_dirs
+    if args.batch_size:
+        config.data.batch_size = args.batch_size
+    if args.epochs:
+        config.train.epochs = args.epochs
+    if args.lr:
+        config.train.lr = args.lr
+    if args.model:
+        config.model.variant = args.model
+    if args.device:
+        config.device = args.device
+    if args.num_workers is not None:
+        config.data.num_workers = args.num_workers
+    if args.wandb:
+        config.train.use_wandb = True
+    if args.no_amp:
+        config.train.use_amp = False
+    if args.resume:
+        config.resume_path = args.resume
+        
+    # 打印配置
+    print("\n" + "=" * 60)
+    print("训练配置")
+    print("=" * 60)
+    print(f"实验名称: {config.exp_name}")
+    print(f"数据目录: {config.data.train_dirs}")
+    print(f"模型: TransUNet-{config.model.variant}")
+    print(f"批次大小: {config.data.batch_size}")
+    print(f"训练轮数: {config.train.epochs}")
+    print(f"学习率: {config.train.lr}")
+    print(f"设备: {config.device}")
+    print(f"混合精度: {config.train.use_amp}")
+    
+    # 开始训练
+    train(config)
 
-    # 保存最终模型
-    torch.save(model.state_dict(), os.path.join(args.output_dir, "final.pth"))
-    writer.close()
-    print(f"\nTraining complete! Best acc: {best_acc:.4f}")
 
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train stability predictor")
-    parser.add_argument("--data_dir", type=str, default="../dataset", help="Dataset dir")
-    parser.add_argument("--output_dir", type=str, default="checkpoints", help="Output dir")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--image_size", type=int, default=224, help="Image size")
-    args = parser.parse_args()
-
-    main(args)
+if __name__ == '__main__':
+    main()

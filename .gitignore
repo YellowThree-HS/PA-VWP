@@ -38,6 +38,7 @@ dataset_messy_small/
 *.zip
 
 result/
+checkpoints/
 train/checkpoints/
 train/checkpoints_twostream/
 train/checkpoints_vit/
