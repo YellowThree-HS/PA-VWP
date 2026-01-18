@@ -15,7 +15,8 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
+from torch.amp import autocast
 from tqdm import tqdm
 
 # 添加项目根目录到路径
@@ -122,7 +123,7 @@ def train_one_epoch(
         
         # 前向传播 (混合精度)
         if config.train.use_amp and scaler is not None:
-            with autocast():
+            with autocast(device_type='cuda'):
                 cls_logits, seg_logits = model(inputs)
                 loss, loss_dict = criterion(cls_logits, seg_logits, cls_targets, seg_targets)
         else:
@@ -228,9 +229,15 @@ def train(config: Config):
     print("加载数据...")
     print("=" * 60)
     
-    train_loader, val_loader = create_dataloaders(
-        train_dirs=config.data.train_dirs,
-        val_dirs=config.data.val_dirs,
+    # 获取完整路径
+    train_dirs = config.data.get_full_paths(config.data.train_dirs)
+    val_dirs = config.data.get_full_paths(config.data.val_dirs) if config.data.val_dirs else None
+    test_dirs = config.data.get_full_paths(config.data.test_dirs) if config.data.test_dirs else None
+    
+    train_loader, val_loader, test_loader = create_dataloaders(
+        train_dirs=train_dirs,
+        val_dirs=val_dirs,
+        test_dirs=test_dirs,
         batch_size=config.data.batch_size,
         num_workers=config.data.num_workers,
         img_size=(config.data.img_height, config.data.img_width),
@@ -241,6 +248,8 @@ def train(config: Config):
     
     print(f"训练批次数: {len(train_loader)}")
     print(f"验证批次数: {len(val_loader)}")
+    if test_loader is not None:
+        print(f"测试批次数: {len(test_loader)}")
     
     # 创建模型
     print("\n" + "=" * 60)
@@ -384,6 +393,30 @@ def train(config: Config):
     print(f"模型保存于: {save_dir}")
     print("=" * 60)
     
+    # 测试集评估
+    if test_loader is not None:
+        print("\n" + "=" * 60)
+        print("测试集评估...")
+        print("=" * 60)
+        
+        # 加载最佳模型
+        best_checkpoint_path = save_dir / f'checkpoint_epoch_{best_epoch}.pth'
+        if best_checkpoint_path.exists():
+            print(f"加载最佳模型: {best_checkpoint_path}")
+            load_checkpoint(model, str(best_checkpoint_path), None, None, config.device)
+        
+        test_metrics = validate(model, test_loader, criterion, device, config)
+        
+        print(f"\n测试集结果:")
+        print(f"  loss: {test_metrics['loss']:.4f}")
+        print(f"  accuracy: {test_metrics['cls_accuracy']:.4f}")
+        print(f"  F1: {test_metrics['cls_f1']:.4f}")
+        print(f"  IoU: {test_metrics['seg_iou']:.4f}")
+        
+        if config.train.use_wandb:
+            import wandb
+            wandb.log({f'test/{k}': v for k, v in test_metrics.items()})
+    
     if config.train.use_wandb:
         import wandb
         wandb.finish()
@@ -453,7 +486,10 @@ def main():
     print("训练配置")
     print("=" * 60)
     print(f"实验名称: {config.exp_name}")
-    print(f"数据目录: {config.data.train_dirs}")
+    print(f"数据根目录: {config.data.data_root}")
+    print(f"训练集: {config.data.train_dirs}")
+    print(f"验证集: {config.data.val_dirs if config.data.val_dirs else '从训练集划分'}")
+    print(f"测试集: {config.data.test_dirs if config.data.test_dirs else '无'}")
     print(f"模型: TransUNet-{config.model.variant}")
     print(f"批次大小: {config.data.batch_size}")
     print(f"训练轮数: {config.train.epochs}")

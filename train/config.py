@@ -5,14 +5,19 @@
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from pathlib import Path
+import os
 
 
 @dataclass
 class DataConfig:
     """数据配置"""
-    # 数据目录
-    train_dirs: List[str] = field(default_factory=lambda: ['dataset_messy_small'])
-    val_dirs: Optional[List[str]] = None  # 如果为 None，从训练集划分
+    # 数据根目录
+    data_root: str = '/DATA/disk0/hs_25/pa'
+    
+    # 数据目录（相对于 data_root 或绝对路径）
+    train_dirs: List[str] = field(default_factory=lambda: ['all_dataset/train'])
+    val_dirs: Optional[List[str]] = field(default_factory=lambda: ['all_dataset/val'])  # 如果为 None，从训练集划分
+    test_dirs: Optional[List[str]] = field(default_factory=lambda: ['all_dataset/test'])  # 测试集目录
     
     # 图像尺寸
     img_height: int = 480
@@ -21,11 +26,21 @@ class DataConfig:
     # 数据加载
     batch_size: int = 8
     num_workers: int = 4
-    val_split: float = 0.2
+    val_split: float = 0.2  # 仅当 val_dirs 为 None 时使用
     use_weighted_sampler: bool = True
     
     # 数据增强
     use_augmentation: bool = True
+    
+    def get_full_paths(self, dirs: List[str]) -> List[str]:
+        """获取完整路径"""
+        full_paths = []
+        for d in dirs:
+            if os.path.isabs(d):
+                full_paths.append(d)
+            else:
+                full_paths.append(os.path.join(self.data_root, d))
+        return full_paths
     
 
 @dataclass
@@ -131,7 +146,14 @@ def get_config(preset: str = 'default') -> Config:
     """获取预设配置"""
     
     if preset == 'default':
-        return Config()
+        return Config(
+            data=DataConfig(
+                data_root='/DATA/disk0/hs_25/pa',
+                train_dirs=['all_dataset/train'],
+                val_dirs=['all_dataset/val'],
+                test_dirs=['all_dataset/test'],
+            ),
+        )
     
     elif preset == 'debug':
         # 调试配置：小批次，快速迭代
@@ -186,7 +208,10 @@ def get_config(preset: str = 'default') -> Config:
         # 使用所有数据集
         return Config(
             data=DataConfig(
-                train_dirs=['dataset3', 'dataset_messy_small'],
+                data_root='/DATA/disk0/hs_25/pa',
+                train_dirs=['all_dataset/train'],
+                val_dirs=['all_dataset/val'],
+                test_dirs=['all_dataset/test'],
                 batch_size=8,
             ),
             model=ModelConfig(

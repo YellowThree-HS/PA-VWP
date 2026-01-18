@@ -27,6 +27,11 @@ dist/
 # 其他
 .DS_Store
 *.log
+logs/
+
+# 大文件/资源文件
+assets/cardboard_textures/*.jpg
+assets/cardboard_textures/*.png
 
 # 数据集
 dataset/
