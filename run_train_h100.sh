@@ -3,15 +3,16 @@
 # H100 交互式训练脚本
 # ==========================================
 # 使用方法：
-#   方式1 (交互式): srun -p student --gres=gpu:1 --cpus-per-task=32 --mem=64G --pty bash run_train_h100.sh
-#   方式2 (后台):   bash run_train_h100.sh --background
-#   方式3 (SLURM):  sbatch train_base_h100.sh
+#   方式1 (后台，默认): bash run_train_h100.sh
+#   方式2 (前台):       bash run_train_h100.sh --foreground 或 -f
+#   方式3 (SLURM):      sbatch train_base_h100.sh
+#   方式4 (交互式):     srun -p student --gres=gpu:1 --cpus-per-task=32 --mem=64G --pty bash run_train_h100.sh --foreground
 # ==========================================
 
-# 检查是否后台模式
-BACKGROUND_MODE=false
-if [[ "$1" == "--background" ]] || [[ "$1" == "-b" ]]; then
-    BACKGROUND_MODE=true
+# 检查是否后台模式（默认后台运行）
+BACKGROUND_MODE=true
+if [[ "$1" == "--foreground" ]] || [[ "$1" == "-f" ]]; then
+    BACKGROUND_MODE=false
 fi
 
 set -e  # 遇到错误立即退出
@@ -137,6 +138,13 @@ echo "  OMP_NUM_THREADS: $OMP_NUM_THREADS"
 echo "  MKL_NUM_THREADS: $MKL_NUM_THREADS"
 
 # ==========================================
+# 恢复训练配置
+# ==========================================
+# 恢复训练配置 (设置为空则从头训练)
+# 例如: RESUME_PATH="checkpoints/transunet_base_h100/checkpoint_epoch_7.pth"
+RESUME_PATH="checkpoints/transunet_base_h100/checkpoint_epoch_7.pth"
+
+# ==========================================
 # 开始训练
 # ==========================================
 echo -e "\n${GREEN}=========================================="
@@ -150,6 +158,9 @@ echo "  --batch_size $BATCH_SIZE"
 echo "  --num_workers $NUM_WORKERS"
 echo "  --epochs 150"
 echo "  --lr 5e-5"
+if [ -n "$RESUME_PATH" ]; then
+    echo "  --resume $RESUME_PATH"
+fi
 echo ""
 
 # 创建日志目录
@@ -165,19 +176,26 @@ echo ""
 echo -e "${GREEN}训练开始...${NC}"
 echo ""
 
+# 构建训练命令
+TRAIN_CMD="python train/train.py \
+    --config base \
+    --model base \
+    --batch_size $BATCH_SIZE \
+    --num_workers $NUM_WORKERS \
+    --epochs 150 \
+    --lr 5e-5 \
+    --exp_name transunet_base_h100"
+
+# 如果设置了恢复路径，添加 --resume 参数
+if [ -n "$RESUME_PATH" ]; then
+    TRAIN_CMD="$TRAIN_CMD --resume $RESUME_PATH"
+fi
+
 # 运行训练
 if [ "$BACKGROUND_MODE" = true ]; then
     # 后台模式：输出只写到文件，不打印到终端
     echo "  → 后台模式：输出重定向到 $LOG_FILE"
-    python train/train.py \
-        --config base \
-        --model base \
-        --batch_size $BATCH_SIZE \
-        --num_workers $NUM_WORKERS \
-        --epochs 150 \
-        --lr 5e-5 \
-        --exp_name "transunet_base_h100" \
-        > "$LOG_FILE" 2>&1 &
+    eval "$TRAIN_CMD" > "$LOG_FILE" 2>&1 &
     
     TRAIN_PID=$!
     echo $TRAIN_PID > "$PID_FILE"
@@ -191,15 +209,7 @@ if [ "$BACKGROUND_MODE" = true ]; then
     echo "查看进程: ps -p $TRAIN_PID"
 else
     # 前台模式：同时输出到终端和文件
-    python train/train.py \
-        --config base \
-        --model base \
-        --batch_size $BATCH_SIZE \
-        --num_workers $NUM_WORKERS \
-        --epochs 150 \
-        --lr 5e-5 \
-        --exp_name "transunet_base_h100" \
-        2>&1 | tee "$LOG_FILE"
+    eval "$TRAIN_CMD" 2>&1 | tee "$LOG_FILE"
 fi
 
 echo ""

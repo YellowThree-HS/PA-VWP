@@ -97,14 +97,35 @@ def visualize_result(
     seg_mask: np.ndarray,
     output_path: str = None,
     threshold: float = 0.5,
+    use_chinese: bool = None,
 ):
     """可视化预测结果"""
-    # 尝试设置中文字体
+    # 尝试设置中文字体并检测是否支持中文
+    if use_chinese is None:
+        use_chinese = False
     try:
-        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
-        plt.rcParams['axes.unicode_minus'] = False
+        import matplotlib.font_manager as fm
+        
+        # 查找可用的中文字体
+        chinese_fonts = []
+        for font in fm.fontManager.ttflist:
+            font_name = font.name.lower()
+            if any(keyword in font_name for keyword in ['simhei', 'simsun', 'yahei', 'microsoft', 'noto', 'wenquanyi', 'droid', 'source han', 'adobe']):
+                chinese_fonts.append(font.name)
+        
+        if chinese_fonts:
+            # 优先使用找到的中文字体
+            plt.rcParams['font.sans-serif'] = chinese_fonts[:3] + ['DejaVu Sans']
+            plt.rcParams['axes.unicode_minus'] = False
+            use_chinese = True
+        else:
+            # 如果没有中文字体，使用英文标签
+            plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+            plt.rcParams['axes.unicode_minus'] = False
     except Exception:
-        pass
+        # 如果字体设置失败，使用默认字体
+        plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
     
     # 兼容新旧版本 Pillow
     try:
@@ -126,31 +147,46 @@ def visualize_result(
     
     fig, axes = plt.subplots(1, 4, figsize=(20, 5))
     
+    # 根据字体支持情况选择标签
+    if use_chinese:
+        title_0 = '原始图像'
+        title_1 = '被移除箱子'
+        title_2 = '稳定性预测'
+        title_3 = '预测受影响区域'
+        stability_text = '稳定' if cls_pred == 1 else '不稳定'
+        conf_text = '置信度'
+    else:
+        title_0 = 'Original Image'
+        title_1 = 'Removed Box'
+        title_2 = 'Stability Prediction'
+        title_3 = 'Predicted Affected Region'
+        stability_text = 'Stable' if cls_pred == 1 else 'Unstable'
+        conf_text = 'Confidence'
+    
     # 原始图像
     axes[0].imshow(rgb)
-    axes[0].set_title('原始图像', fontsize=14)
+    axes[0].set_title(title_0, fontsize=14)
     axes[0].axis('off')
     
     # 被移除箱子
     axes[1].imshow(rgb)
     axes[1].imshow(removed_mask, alpha=0.5, cmap='Greens')
-    axes[1].set_title('被移除箱子', fontsize=14)
+    axes[1].set_title(title_1, fontsize=14)
     axes[1].axis('off')
     
     # 分类结果
-    stability = '稳定' if cls_pred == 1 else '不稳定'
     color = 'green' if cls_pred == 1 else 'red'
-    axes[2].text(0.5, 0.5, f'{stability}\n置信度: {cls_prob:.2%}',
+    axes[2].text(0.5, 0.5, f'{stability_text}\n{conf_text}: {cls_prob:.2%}',
                  ha='center', va='center', fontsize=20, color=color,
                  transform=axes[2].transAxes,
                  bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-    axes[2].set_title('稳定性预测', fontsize=14)
+    axes[2].set_title(title_2, fontsize=14)
     axes[2].axis('off')
     
     # 受影响区域
     axes[3].imshow(rgb)
     axes[3].imshow(seg_mask_resized, alpha=0.6, cmap='Reds')
-    axes[3].set_title('预测受影响区域', fontsize=14)
+    axes[3].set_title(title_3, fontsize=14)
     axes[3].axis('off')
     
     plt.tight_layout()
@@ -173,6 +209,8 @@ def main():
     parser.add_argument('--output', type=str, default=None, help='输出图像路径')
     parser.add_argument('--device', type=str, default='cuda', help='设备')
     parser.add_argument('--threshold', type=float, default=0.5, help='分类阈值')
+    parser.add_argument('--lang', type=str, default='auto', choices=['auto', 'zh', 'en'], 
+                        help='标签语言: auto(自动检测), zh(中文), en(英文)')
     
     args = parser.parse_args()
     
@@ -191,17 +229,31 @@ def main():
     cls_pred, cls_prob, seg_mask = predict(model, input_tensor, device, args.threshold)
     
     # 打印结果
-    stability = '稳定' if cls_pred == 1 else '不稳定'
-    print(f"\n预测结果:")
-    print(f"  稳定性: {stability}")
-    print(f"  置信度: {cls_prob:.2%}")
+    if args.lang == 'en':
+        stability = 'Stable' if cls_pred == 1 else 'Unstable'
+        print(f"\nPrediction Results:")
+        print(f"  Stability: {stability}")
+        print(f"  Confidence: {cls_prob:.2%}")
+    else:
+        stability = '稳定' if cls_pred == 1 else '不稳定'
+        print(f"\n预测结果:")
+        print(f"  稳定性: {stability}")
+        print(f"  置信度: {cls_prob:.2%}")
+    
+    # 确定使用的语言
+    if args.lang == 'zh':
+        use_chinese = True
+    elif args.lang == 'en':
+        use_chinese = False
+    else:  # auto
+        use_chinese = None  # 自动检测
     
     # 可视化
     output_path = args.output or 'prediction_result.png'
     visualize_result(
         args.image, args.mask,
         cls_pred, cls_prob, seg_mask,
-        output_path, args.threshold
+        output_path, args.threshold, use_chinese
     )
 
 

@@ -84,6 +84,10 @@ LR=5e-5
 # 训练轮数
 EPOCHS=150
 
+# 恢复训练配置 (设置为空则从头训练)
+# 例如: RESUME_PATH="checkpoints/transunet_base_h100/checkpoint_epoch_7.pth"
+RESUME_PATH="checkpoints/transunet_base_h100/checkpoint_epoch_7.pth"
+
 # ==========================================
 # 开始训练
 # ==========================================
@@ -97,16 +101,28 @@ echo "Batch Size: $BATCH_SIZE"
 echo "Num Workers: $NUM_WORKERS"
 echo "Learning Rate: $LR"
 echo "Epochs: $EPOCHS"
+if [ -n "$RESUME_PATH" ]; then
+    echo "恢复训练: $RESUME_PATH"
+fi
 echo ""
 
-python train/train.py \
+# 构建训练命令
+TRAIN_CMD="python train/train.py \
     --config $CONFIG \
     --model $MODEL \
     --batch_size $BATCH_SIZE \
     --num_workers $NUM_WORKERS \
     --lr $LR \
     --epochs $EPOCHS \
-    --exp_name "transunet_base_h100"
+    --exp_name transunet_base_h100"
+
+# 如果设置了恢复路径，添加 --resume 参数
+if [ -n "$RESUME_PATH" ]; then
+    TRAIN_CMD="$TRAIN_CMD --resume $RESUME_PATH"
+fi
+
+# 执行训练
+eval $TRAIN_CMD
 
 # 记录结束信息
 echo ""
