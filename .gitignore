@@ -41,6 +41,7 @@ dataset_messy/
 dataset_messy_small/
 *.rar
 *.zip
+round_101_79_south/
 
 result/
 checkpoints/
