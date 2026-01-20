@@ -137,9 +137,9 @@ class Config:
     device: str = 'cuda'  # 'cuda', 'cpu'
     
     def __post_init__(self):
-        # 创建保存目录
-        save_path = Path(self.train.save_dir) / self.exp_name
-        save_path.mkdir(parents=True, exist_ok=True)
+        # 注意：保存目录在实际训练时创建，而不是在配置初始化时
+        # 这样可以避免在命令行参数覆盖 exp_name 后留下空目录
+        pass
 
 
 def get_config(preset: str = 'default') -> Config:

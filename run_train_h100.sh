@@ -140,10 +140,33 @@ echo "  MKL_NUM_THREADS: $MKL_NUM_THREADS"
 # ==========================================
 # 恢复训练配置
 # ==========================================
-# 恢复训练配置 (设置为空则从头训练)
-# 例如: RESUME_PATH="checkpoints/transunet_base_h100/checkpoint_epoch_7.pth"
-RESUME_PATH="checkpoints/transunet_base_h100/checkpoint_epoch_7.pth"
+# 默认逻辑：
+#   - 到 /DATA/disk0/hs_25/pa/checkpoints/transunet_base_h100 下
+#   - 自动寻找最新的 checkpoint_epoch_*.pth 作为恢复点
+#   - 如果目录不存在或没有 checkpoint，则从头训练
+#
+# 如需手动指定，可以直接修改下面的 RESUME_PATH，或在运行前导出环境变量：
+#   export RESUME_PATH=/绝对/路径/to/checkpoint_epoch_X.pth
+CHECKPOINT_DIR="/DATA/disk0/hs_25/pa/checkpoints/transunet_base_h100"
 
+# 如果用户通过环境变量显式指定了 RESUME_PATH，则优先使用
+if [ -n "${RESUME_PATH:-}" ]; then
+    echo "  使用环境变量指定的恢复路径: $RESUME_PATH"
+else
+    RESUME_PATH=""
+    if [ -d "$CHECKPOINT_DIR" ]; then
+        # 查找最新的 checkpoint_epoch_*.pth
+        LATEST_CKPT=$(ls -t "$CHECKPOINT_DIR"/checkpoint_epoch_*.pth 2>/dev/null | head -1 || true)
+        if [ -n "$LATEST_CKPT" ]; then
+            RESUME_PATH="$LATEST_CKPT"
+            echo "  自动检测到最新 checkpoint: $RESUME_PATH"
+        else
+            echo "  未在 $CHECKPOINT_DIR 中找到 checkpoint，將从头训练"
+        fi
+    else
+        echo "  checkpoint 目录不存在: $CHECKPOINT_DIR，将从头训练"
+    fi
+fi
 # ==========================================
 # 开始训练
 # ==========================================

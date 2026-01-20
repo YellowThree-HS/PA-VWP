@@ -1,4 +1,14 @@
 #!/bin/bash
+
+# 激活 Conda 环境
+if command -v conda &> /dev/null; then
+    # 确保可以使用 `conda activate`
+    eval "$(conda shell.bash hook)"
+    conda activate isaac
+else
+    echo "警告: 未找到 conda 命令，无法激活 isaac 环境" >&2
+fi
+
 # ==========================================
 # H100 交互式训练脚本 - ConvNeXt RGBD 版本 (带深度图)
 # ==========================================

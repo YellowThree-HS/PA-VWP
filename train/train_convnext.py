@@ -139,7 +139,13 @@ def train_one_epoch(
         if config.train.use_amp and scaler is not None:
             with autocast(device_type='cuda'):
                 cls_logits, seg_logits = model(inputs)
-                loss, loss_dict = criterion(cls_logits, seg_logits, cls_targets, seg_targets)
+            # 在 autocast 外部计算 loss，强制使用 FP32，避免数值不稳定
+            loss, loss_dict = criterion(
+                cls_logits.float(), 
+                seg_logits.float(), 
+                cls_targets.float(), 
+                seg_targets.float()
+            )
         else:
             cls_logits, seg_logits = model(inputs)
             loss, loss_dict = criterion(cls_logits, seg_logits, cls_targets, seg_targets)

@@ -1,4 +1,14 @@
 #!/bin/bash
+
+# 激活 Conda 环境
+if command -v conda &> /dev/null; then
+    # 确保可以使用 `conda activate`
+    eval "$(conda shell.bash hook)"
+    conda activate isaac
+else
+    echo "警告: 未找到 conda 命令，无法激活 isaac 环境" >&2
+fi
+
 # ==========================================
 # H100 交互式训练脚本 - ConvNeXt 版本 (RGB)
 # ==========================================
@@ -87,7 +97,7 @@ cd /home/hs_25/projs/PA-VWP
 # ConvNeXt 比 ResNet-50 占用更多显存 (更深的层，更大的中间特征)
 # H100 80GB 需要适当减小 batch size
 if [ "$IS_H100" = true ]; then
-    BATCH_SIZE=16  # ConvNeXt 需要更小的 batch size
+    BATCH_SIZE=28  # ConvNeXt 需要更小的 batch size
 else
     # 提取显存 GB 数（去除单位）
     GPU_MEM_GB=$(echo $GPU_MEM | grep -oP '\d+' | head -1)
@@ -153,7 +163,7 @@ echo "  MKL_NUM_THREADS: $MKL_NUM_THREADS"
 # 恢复训练配置 (设置为空则从头训练)
 # 注意：模型保存在 /DATA/disk0/hs_25/pa/checkpoints/ 目录下
 # 例如: RESUME_PATH="/DATA/disk0/hs_25/pa/checkpoints/transunet_convnext_base_h100/checkpoint_epoch_7.pth"
-RESUME_PATH=""
+RESUME_PATH="/DATA/disk0/hs_25/pa/checkpoints/transunet_convnext_base_h100/checkpoint_epoch_6_best.pth"
 
 # ==========================================
 # 开始训练

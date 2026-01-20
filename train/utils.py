@@ -4,6 +4,8 @@
 
 import os
 import random
+import shutil
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -69,13 +71,18 @@ class FocalLoss(nn.Module):
 
 
 class DiceLoss(nn.Module):
-    """Dice Loss for segmentation"""
+    """Dice Loss for segmentation (数值稳定版本)"""
     
-    def __init__(self, smooth: float = 1.0):
+    def __init__(self, smooth: float = 1.0, eps: float = 1e-7):
         super().__init__()
         self.smooth = smooth
+        self.eps = eps  # 防止除零的小常数
         
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # 强制转换为 FP32，避免 AMP 训练时的数值不稳定
+        inputs = inputs.float()
+        targets = targets.float()
+        
         inputs = torch.sigmoid(inputs)
         
         # Flatten
@@ -83,28 +90,41 @@ class DiceLoss(nn.Module):
         targets = targets.view(-1)
         
         intersection = (inputs * targets).sum()
-        dice = (2. * intersection + self.smooth) / (inputs.sum() + targets.sum() + self.smooth)
+        denominator = inputs.sum() + targets.sum() + self.smooth + self.eps
+        dice = (2. * intersection + self.smooth) / denominator
+        
+        # 确保结果在有效范围内
+        dice = torch.clamp(dice, min=self.eps, max=1.0 - self.eps)
         
         return 1 - dice
 
 
 class DiceBCELoss(nn.Module):
-    """Dice + BCE Loss"""
+    """Dice + BCE Loss (数值稳定版本)"""
     
-    def __init__(self, smooth: float = 1.0, dice_weight: float = 0.5):
+    def __init__(self, smooth: float = 1.0, dice_weight: float = 0.5, eps: float = 1e-7):
         super().__init__()
-        self.dice_loss = DiceLoss(smooth)
+        self.dice_loss = DiceLoss(smooth, eps)
         self.bce_loss = nn.BCEWithLogitsLoss()
         self.dice_weight = dice_weight
         
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # 强制转换为 FP32，避免 AMP 训练时的数值不稳定
+        inputs = inputs.float()
+        targets = targets.float()
+        
         dice = self.dice_loss(inputs, targets)
         bce = self.bce_loss(inputs, targets)
         return self.dice_weight * dice + (1 - self.dice_weight) * bce
 
 
 class CombinedLoss(nn.Module):
-    """组合损失：分类 + 分割"""
+    """组合损失：分类 + 分割
+    
+    关键改进：
+    1. 只对不稳定样本（cls_targets=0）计算分割 loss
+    2. 增加正样本权重处理像素级不平衡
+    """
     
     def __init__(
         self,
@@ -113,6 +133,7 @@ class CombinedLoss(nn.Module):
         cls_weight: float = 1.0,
         seg_weight: float = 1.0,
         pos_weight: float = 1.0,
+        seg_pos_weight: float = 10.0,  # 分割任务的正样本权重
         focal_gamma: float = 2.0,
         focal_alpha: float = 0.25,
         dice_smooth: float = 1.0,
@@ -121,6 +142,7 @@ class CombinedLoss(nn.Module):
         
         self.cls_weight = cls_weight
         self.seg_weight = seg_weight
+        self.seg_pos_weight = seg_pos_weight
         
         # 分类损失
         if cls_loss == 'bce':
@@ -130,13 +152,16 @@ class CombinedLoss(nn.Module):
         else:
             raise ValueError(f"未知的分类损失: {cls_loss}")
             
-        # 分割损失
+        # 分割损失 - 使用带权重的 BCE
         if seg_loss == 'bce':
-            self.seg_criterion = nn.BCEWithLogitsLoss()
+            self.seg_bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([seg_pos_weight]))
+            self.seg_dice = None
         elif seg_loss == 'dice':
-            self.seg_criterion = DiceLoss(smooth=dice_smooth)
+            self.seg_bce = None
+            self.seg_dice = DiceLoss(smooth=dice_smooth)
         elif seg_loss == 'dice_bce':
-            self.seg_criterion = DiceBCELoss(smooth=dice_smooth)
+            self.seg_bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([seg_pos_weight]))
+            self.seg_dice = DiceLoss(smooth=dice_smooth)
         else:
             raise ValueError(f"未知的分割损失: {seg_loss}")
             
@@ -151,19 +176,42 @@ class CombinedLoss(nn.Module):
         Args:
             cls_logits: (B, 1) 分类 logits
             seg_logits: (B, 1, H, W) 分割 logits
-            cls_targets: (B,) 分类标签
+            cls_targets: (B,) 分类标签 - 0=不稳定, 1=稳定
             seg_targets: (B, 1, H, W) 分割掩码
             
         Returns:
             total_loss: 总损失
             loss_dict: 各部分损失
         """
+        # 确保 pos_weight 在正确的设备上
+        if self.seg_bce is not None and self.seg_bce.pos_weight.device != seg_logits.device:
+            self.seg_bce.pos_weight = self.seg_bce.pos_weight.to(seg_logits.device)
+        if hasattr(self.cls_criterion, 'pos_weight') and self.cls_criterion.pos_weight.device != cls_logits.device:
+            self.cls_criterion.pos_weight = self.cls_criterion.pos_weight.to(cls_logits.device)
+        
         # 分类损失
         cls_loss = self.cls_criterion(cls_logits.squeeze(-1), cls_targets)
         
-        # 分割损失 (仅对不稳定样本计算，因为稳定样本没有受影响区域)
-        # 但为了梯度稳定，我们对所有样本计算，稳定样本的 target 是全 0
-        seg_loss = self.seg_criterion(seg_logits, seg_targets)
+        # 分割损失 - 只对不稳定样本计算（cls_targets=0 表示不稳定）
+        unstable_mask = (cls_targets == 0)
+        n_unstable = unstable_mask.sum().item()
+        
+        if n_unstable > 0:
+            seg_logits_unstable = seg_logits[unstable_mask]
+            seg_targets_unstable = seg_targets[unstable_mask]
+            
+            if self.seg_bce is not None and self.seg_dice is not None:
+                # Dice + BCE
+                bce_loss = self.seg_bce(seg_logits_unstable, seg_targets_unstable)
+                dice_loss = self.seg_dice(seg_logits_unstable, seg_targets_unstable)
+                seg_loss = 0.5 * bce_loss + 0.5 * dice_loss
+            elif self.seg_bce is not None:
+                seg_loss = self.seg_bce(seg_logits_unstable, seg_targets_unstable)
+            else:
+                seg_loss = self.seg_dice(seg_logits_unstable, seg_targets_unstable)
+        else:
+            # 批次中全是稳定样本，分割 loss 为 0
+            seg_loss = torch.tensor(0.0, device=seg_logits.device, requires_grad=True)
         
         # 总损失
         total_loss = self.cls_weight * cls_loss + self.seg_weight * seg_loss
@@ -182,7 +230,10 @@ class CombinedLoss(nn.Module):
 # =============================================================================
 
 class MetricCalculator:
-    """评估指标计算器"""
+    """评估指标计算器
+    
+    关键改进：只对不稳定样本计算分割指标
+    """
     
     def __init__(self, threshold: float = 0.5):
         self.threshold = threshold
@@ -196,7 +247,7 @@ class MetricCalculator:
         self.cls_tn = 0
         self.cls_fn = 0
         
-        # 分割指标
+        # 分割指标 (只统计不稳定样本)
         self.seg_intersection = 0
         self.seg_union = 0
         self.seg_pred_sum = 0
@@ -204,6 +255,7 @@ class MetricCalculator:
         
         # 样本计数
         self.n_samples = 0
+        self.n_unstable_samples = 0
         
     def update(
         self,
@@ -224,18 +276,26 @@ class MetricCalculator:
             self.cls_tn += ((cls_preds == 0) & (cls_targets == 0)).sum().item()
             self.cls_fn += ((cls_preds == 0) & (cls_targets == 1)).sum().item()
             
-            # 分割预测
-            seg_probs = torch.sigmoid(seg_logits)
-            seg_preds = (seg_probs > self.threshold).float()
+            # 分割指标 - 只对不稳定样本计算（cls_targets=0）
+            unstable_mask = (cls_targets == 0)
+            n_unstable = unstable_mask.sum().item()
             
-            # 分割 IoU
-            intersection = (seg_preds * seg_targets).sum().item()
-            union = ((seg_preds + seg_targets) > 0).float().sum().item()
-            
-            self.seg_intersection += intersection
-            self.seg_union += union
-            self.seg_pred_sum += seg_preds.sum().item()
-            self.seg_target_sum += seg_targets.sum().item()
+            if n_unstable > 0:
+                seg_logits_unstable = seg_logits[unstable_mask]
+                seg_targets_unstable = seg_targets[unstable_mask]
+                
+                seg_probs = torch.sigmoid(seg_logits_unstable)
+                seg_preds = (seg_probs > self.threshold).float()
+                
+                # 分割 IoU
+                intersection = (seg_preds * seg_targets_unstable).sum().item()
+                union = ((seg_preds + seg_targets_unstable) > 0).float().sum().item()
+                
+                self.seg_intersection += intersection
+                self.seg_union += union
+                self.seg_pred_sum += seg_preds.sum().item()
+                self.seg_target_sum += seg_targets_unstable.sum().item()
+                self.n_unstable_samples += n_unstable
             
             self.n_samples += cls_targets.size(0)
             
@@ -380,8 +440,23 @@ def save_checkpoint(
     metrics: Dict,
     save_path: str,
     is_best: bool = False,
+    max_retries: int = 3,
+    use_temp_file: bool = True,
 ):
-    """保存检查点"""
+    """
+    保存检查点（带错误处理和重试机制）
+    
+    Args:
+        model: 模型
+        optimizer: 优化器
+        scheduler: 学习率调度器
+        epoch: 当前 epoch
+        metrics: 指标字典
+        save_path: 保存路径
+        is_best: 是否为最佳模型
+        max_retries: 最大重试次数
+        use_temp_file: 是否使用临时文件（先保存到 /tmp，再移动，避免 NFS 写入问题）
+    """
     # 安全获取 scheduler state_dict
     scheduler_state = None
     if scheduler is not None:
@@ -398,11 +473,108 @@ def save_checkpoint(
         'metrics': metrics,
     }
     
-    torch.save(checkpoint, save_path)
+    # 保存主 checkpoint
+    save_path_obj = Path(save_path)
+    save_path_obj.parent.mkdir(parents=True, exist_ok=True)
     
-    if is_best:
-        best_path = save_path.replace('.pth', '_best.pth')
-        torch.save(checkpoint, best_path)
+    success = False
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            if use_temp_file:
+                # 使用临时文件：先保存到 /tmp，再原子性移动到目标位置
+                # 这样可以避免 NFS 写入中断导致文件损坏
+                with tempfile.NamedTemporaryFile(
+                    mode='wb', 
+                    delete=False, 
+                    dir='/tmp',
+                    suffix='.pth'
+                ) as tmp_file:
+                    tmp_path = tmp_file.name
+                
+                try:
+                    # 保存到临时文件
+                    torch.save(checkpoint, tmp_path)
+                    # 原子性移动到目标位置
+                    shutil.move(tmp_path, save_path)
+                    success = True
+                except Exception as e:
+                    # 清理临时文件
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except:
+                            pass
+                    raise e
+            else:
+                # 直接保存（如果目标目录是本地文件系统）
+                torch.save(checkpoint, save_path)
+                success = True
+            
+            break  # 成功则退出重试循环
+            
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 2  # 递增等待时间：2s, 4s, 6s
+                print(f"警告: 保存 checkpoint 失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                print(f"  {wait_time} 秒后重试...")
+                time.sleep(wait_time)
+            else:
+                print(f"错误: 保存 checkpoint 失败，已重试 {max_retries} 次")
+                print(f"  路径: {save_path}")
+                print(f"  错误: {last_error}")
+                # 不抛出异常，让训练继续（但打印警告）
+                return False
+    
+    # 保存最佳模型副本
+    if success and is_best:
+        best_path = str(save_path_obj.with_suffix('')) + '_best.pth'
+        best_success = False
+        
+        for attempt in range(max_retries):
+            try:
+                if use_temp_file:
+                    with tempfile.NamedTemporaryFile(
+                        mode='wb', 
+                        delete=False, 
+                        dir='/tmp',
+                        suffix='.pth'
+                    ) as tmp_file:
+                        tmp_path = tmp_file.name
+                    
+                    try:
+                        torch.save(checkpoint, tmp_path)
+                        shutil.move(tmp_path, best_path)
+                        best_success = True
+                    except Exception as e:
+                        if os.path.exists(tmp_path):
+                            try:
+                                os.remove(tmp_path)
+                            except:
+                                pass
+                        raise e
+                else:
+                    torch.save(checkpoint, best_path)
+                    best_success = True
+                
+                break
+                
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    import time
+                    wait_time = (attempt + 1) * 2
+                    print(f"警告: 保存最佳模型失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(wait_time)
+                else:
+                    print(f"错误: 保存最佳模型失败，已重试 {max_retries} 次")
+                    print(f"  路径: {best_path}")
+                    print(f"  错误: {e}")
+        
+        return best_success if is_best else success
+    
+    return success
         
 
 def load_checkpoint(
