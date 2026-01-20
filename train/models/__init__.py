@@ -11,7 +11,6 @@ Attention-Based TransUNet for Physical Stability Prediction
 
 消融实验模型:
 - *_cls_only: 仅分类 (无分割头)
-- *_seg_only: 仅分割 (无分类头)
 """
 
 # ResNet-50 版本
