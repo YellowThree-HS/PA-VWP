@@ -39,7 +39,7 @@ echo "----------------------------------------------"
 
 # ========== 超参数 ==========
 MODEL_VARIANT="base"       # tiny / small / base
-BATCH_SIZE=36              # ResNet比ConvNeXt更省内存
+BATCH_SIZE=36
 EPOCHS=150
 LR=5e-5
 NUM_WORKERS=8
