@@ -483,12 +483,26 @@ def save_checkpoint(
     for attempt in range(max_retries):
         try:
             if use_temp_file:
-                # 使用临时文件：先保存到 /tmp，再原子性移动到目标位置
-                # 这样可以避免 NFS 写入中断导致文件损坏
+                # 使用临时文件：先保存到目标目录所在文件系统的临时目录，再原子性移动
+                # 这样可以避免 NFS 写入中断导致文件损坏，同时避免 /tmp 空间不足
+                # 优先使用目标目录的父目录作为临时目录，如果失败则回退到 /tmp
+                temp_dir = str(save_path_obj.parent)
+                try:
+                    # 检查目标目录所在文件系统是否有足够空间（至少需要文件大小的 1.5 倍）
+                    stat = shutil.disk_usage(temp_dir)
+                    # 估算 checkpoint 大小（粗略估计，实际可能更大）
+                    estimated_size = 1024 * 1024 * 1024  # 1GB 作为保守估计
+                    if stat.free < estimated_size * 2:
+                        # 如果目标目录空间不足，尝试使用 /tmp
+                        temp_dir = '/tmp'
+                except Exception:
+                    # 如果无法检查空间，回退到 /tmp
+                    temp_dir = '/tmp'
+                
                 with tempfile.NamedTemporaryFile(
                     mode='wb', 
                     delete=False, 
-                    dir='/tmp',
+                    dir=temp_dir,
                     suffix='.pth'
                 ) as tmp_file:
                     tmp_path = tmp_file.name
@@ -536,10 +550,22 @@ def save_checkpoint(
         for attempt in range(max_retries):
             try:
                 if use_temp_file:
+                    # 使用与主 checkpoint 相同的临时目录策略
+                    best_path_obj = Path(best_path)
+                    temp_dir = str(best_path_obj.parent)
+                    try:
+                        # 检查目标目录所在文件系统是否有足够空间
+                        stat = shutil.disk_usage(temp_dir)
+                        estimated_size = 1024 * 1024 * 1024  # 1GB 作为保守估计
+                        if stat.free < estimated_size * 2:
+                            temp_dir = '/tmp'
+                    except Exception:
+                        temp_dir = '/tmp'
+                    
                     with tempfile.NamedTemporaryFile(
                         mode='wb', 
                         delete=False, 
-                        dir='/tmp',
+                        dir=temp_dir,
                         suffix='.pth'
                     ) as tmp_file:
                         tmp_path = tmp_file.name
