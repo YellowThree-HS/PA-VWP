@@ -466,6 +466,7 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=None, help='批次大小')
     parser.add_argument('--epochs', type=int, default=None, help='训练轮数')
     parser.add_argument('--lr', type=float, default=None, help='学习率')
+    parser.add_argument('--save_dir', type=str, default=None, help='checkpoint 保存根目录（默认使用数据盘）')
     parser.add_argument('--model', type=str, default=None, 
                         choices=['small', 'base'], help='模型变体 (fusion 只支持 small/base)')
     parser.add_argument('--device', type=str, default=None, help='设备 (cuda/cpu)')
@@ -495,6 +496,8 @@ def main():
         config.train.epochs = args.epochs
     if args.lr:
         config.train.lr = args.lr
+    if args.save_dir:
+        config.train.save_dir = args.save_dir
     if args.model:
         config.model.variant = args.model
     if args.device:
@@ -507,6 +510,11 @@ def main():
         config.train.use_amp = False
     if args.resume:
         config.resume_path = args.resume
+
+    # 统一默认保存目录：避免相对路径导致写到 $HOME 或其他 cwd
+    # 仅当仍为默认值（通常为 'checkpoints'）时，切换到数据盘
+    if getattr(config.train, 'save_dir', None) in (None, '', 'checkpoints'):
+        config.train.save_dir = '/DATA/disk0/hs_25/pa/checkpoints'
         
     # 打印配置
     print("\n" + "=" * 60)
@@ -522,6 +530,7 @@ def main():
     print(f"批次大小: {config.data.batch_size}")
     print(f"训练轮数: {config.train.epochs}")
     print(f"学习率: {config.train.lr}")
+    print(f"保存目录: {config.train.save_dir}")
     print(f"设备: {config.device}")
     print(f"混合精度: {config.train.use_amp}")
     print("=" * 60)
