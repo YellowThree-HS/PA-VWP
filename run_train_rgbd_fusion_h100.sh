@@ -159,15 +159,20 @@ echo "  MKL_NUM_THREADS: $MKL_NUM_THREADS"
 # ==========================================
 # 恢复训练配置
 # ==========================================
-CHECKPOINT_DIR="/DATA/disk0/hs_25/pa/checkpoints/transunet_rgbd_fusion_base_h100"
+SAVE_DIR="/DATA/disk0/hs_25/pa/checkpoints"
+CHECKPOINT_DIR="$SAVE_DIR/transunet_rgbd_fusion_base_h100"
 
 if [ -n "${RESUME_PATH:-}" ]; then
     echo "  使用环境变量指定的恢复路径: $RESUME_PATH"
 else
     RESUME_PATH=""
     if [ -d "$CHECKPOINT_DIR" ]; then
+        BEST_CKPT=$(ls -t "$CHECKPOINT_DIR"/checkpoint_*best*.pth 2>/dev/null | head -1 || true)
         LATEST_CKPT=$(ls -t "$CHECKPOINT_DIR"/checkpoint_epoch_*.pth 2>/dev/null | head -1 || true)
-        if [ -n "$LATEST_CKPT" ]; then
+        if [ -n "$BEST_CKPT" ]; then
+            RESUME_PATH="$BEST_CKPT"
+            echo "  自动检测到最佳 checkpoint: $RESUME_PATH"
+        elif [ -n "$LATEST_CKPT" ]; then
             RESUME_PATH="$LATEST_CKPT"
             echo "  自动检测到最新 checkpoint: $RESUME_PATH"
         else
@@ -216,6 +221,7 @@ echo ""
 TRAIN_CMD="python train/train_rgbd_fusion.py \
     --config base \
     --model base \
+    --save_dir $SAVE_DIR \
     --batch_size $BATCH_SIZE \
     --num_workers $NUM_WORKERS \
     --epochs 150 \
