@@ -26,6 +26,23 @@ from .transunet_rgbd_fusion import TransUNetRGBDFusion, TransUNetRGBDFusionConfi
 # Seg-From-Encoded 版本 (分割头直接从 Encoded 特征解码)
 from .transunet_seg_from_encoded import TransUNetSegFromEncoded, TransUNetSegFromEncodedConfig
 
+# VIPFormer Seg-Guided (RGB / RGBD)
+from .vipformer_seg_guided import (
+    VIPFormerSegGuided,
+    VIPFormerSegGuidedConfig,
+    create_vipformer_seg_guided,
+    vipformer_seg_guided_base,
+    vipformer_seg_guided_small,
+    vipformer_seg_guided_tiny,
+)
+from .vipformer_rgbd_seg_guided import (
+    VIPFormerRGBDSegGuided,
+    VIPFormerRGBDSegGuidedConfig,
+    create_vipformer_rgbd_seg_guided,
+    vipformer_rgbd_seg_guided_base,
+    vipformer_rgbd_seg_guided_tiny,
+)
+
 __all__ = [
     # ResNet-50 版本
     'TransUNet', 'TransUNetConfig',
@@ -35,4 +52,11 @@ __all__ = [
     'TransUNetRGBDFusion', 'TransUNetRGBDFusionConfig',
     # Seg-From-Encoded 版本
     'TransUNetSegFromEncoded', 'TransUNetSegFromEncodedConfig',
+    # VIPFormer Seg-Guided
+    'VIPFormerSegGuided', 'VIPFormerSegGuidedConfig',
+    'create_vipformer_seg_guided',
+    'vipformer_seg_guided_base', 'vipformer_seg_guided_small', 'vipformer_seg_guided_tiny',
+    'VIPFormerRGBDSegGuided', 'VIPFormerRGBDSegGuidedConfig',
+    'create_vipformer_rgbd_seg_guided',
+    'vipformer_rgbd_seg_guided_base', 'vipformer_rgbd_seg_guided_tiny',
 ]
