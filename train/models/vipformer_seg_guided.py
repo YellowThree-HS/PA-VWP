@@ -148,9 +148,12 @@ class UncertaintyWeighting(nn.Module):
         )
 
     def forward(self, seg_logits):
-        probs = torch.sigmoid(seg_logits)
-        entropy = -probs * torch.log(probs + 1e-8) - (1 - probs) * torch.log(1 - probs + 1e-8)
+        # 使用 clamp 确保数值稳定性
+        probs = torch.sigmoid(seg_logits).clamp(1e-6, 1 - 1e-6)
+        entropy = -probs * torch.log(probs) - (1 - probs) * torch.log(1 - probs)
         mean_entropy = entropy.mean(dim=(1, 2, 3)).unsqueeze(-1)
+        # 归一化熵值到合理范围 (二分类最大熵为 ln(2) ≈ 0.693)
+        mean_entropy = mean_entropy / 0.693
         return self.net(mean_entropy)
 
 
