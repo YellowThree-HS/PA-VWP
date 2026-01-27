@@ -35,6 +35,7 @@ from train.models.transunet_fusion import (
     TransUNetFusionConfig,
     transunet_fusion_base, 
     transunet_fusion_small,
+    transunet_fusion_tiny,
 )
 from train.utils import (
     set_seed,
@@ -55,7 +56,14 @@ def create_model_fusion(config: Config, device: torch.device) -> nn.Module:
     """创建融合模型"""
     model_config = config.model
     
-    if model_config.variant == 'small':
+    if model_config.variant == 'tiny':
+        model = transunet_fusion_tiny(
+            pretrained=model_config.pretrained,
+            img_height=config.data.img_height,
+            img_width=config.data.img_width,
+            dropout=model_config.dropout,
+        )
+    elif model_config.variant == 'small':
         model = transunet_fusion_small(
             pretrained=model_config.pretrained,
             img_height=config.data.img_height,
@@ -385,7 +393,7 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=None, help='学习率')
     parser.add_argument('--save_dir', type=str, default=None, help='checkpoint 保存根目录（默认使用数据盘）')
     parser.add_argument('--model', type=str, default=None, 
-                        choices=['small', 'base'], help='模型变体 (fusion 只支持 small/base)')
+                        choices=['tiny', 'small', 'base'], help='模型变体')
     parser.add_argument('--device', type=str, default=None, help='设备 (cuda/cpu)')
     parser.add_argument('--num_workers', type=int, default=None, help='数据加载线程数')
     parser.add_argument('--resume', type=str, default=None, help='恢复训练的检查点路径')

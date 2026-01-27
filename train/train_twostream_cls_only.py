@@ -1,10 +1,16 @@
 """
-TransUNet ResNet-50 仅分类训练脚本
-用于多任务学习消融实验 - 仅分类任务
+TransUNet 双流网络 仅分类训练脚本
+双流网络: RGB分支 + 深度分支，特征级融合
+用于多任务学习消融实验 - 仅分类任务 (无分割头)
 
 用法:
-    python train_cls_only.py --config base
-    python train_cls_only.py --config debug
+    python train_twostream_cls_only.py --config base
+    python train_twostream_cls_only.py --config debug
+    python train_twostream_cls_only.py --model tiny --batch_size 40
+
+特点:
+- 双流网络: RGB+Mask 和 Depth 分别编码，在特征级融合
+- 仅分类头，无分割头
 """
 
 import argparse
@@ -22,13 +28,15 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from train.config import Config, DataConfig, ModelConfig, TrainConfig, LossConfig
-from train.dataset import create_dataloaders
-from train.models.transunet_cls_only import (
-    TransUNetClsOnly,
-    transunet_cls_only_base,
-    transunet_cls_only_small,
-    transunet_cls_only_tiny,
-    transunet_cls_only_micro,
+from train.dataset_with_depth import create_dataloaders_with_depth
+from train.models.transunet_twostream import (
+    TransUNetTwoStreamClsOnly,
+    TransUNetTwoStreamConfig,
+    create_twostream_cls_only,
+    twostream_cls_only_base,
+    twostream_cls_only_small,
+    twostream_cls_only_tiny,
+    twostream_cls_only_micro,
 )
 from train.utils import (
     set_seed, get_device, create_optimizer, create_scheduler,
@@ -80,24 +88,58 @@ class ClassificationMetricCalculator:
 
 
 def create_model(config: Config, device: torch.device) -> nn.Module:
+    """创建双流网络仅分类模型"""
     model_config = config.model
     
+    # 通用参数
+    common_kwargs = dict(
+        pretrained=model_config.pretrained,
+        img_height=config.data.img_height,
+        img_width=config.data.img_width,
+        dropout=model_config.dropout,
+        fusion_type='concat',
+        depth_branch_type='resnet50',
+    )
+    
     if model_config.variant == 'micro':
-        model = transunet_cls_only_micro(pretrained=model_config.pretrained,
-            img_height=config.data.img_height, img_width=config.data.img_width, dropout=model_config.dropout)
+        model = create_twostream_cls_only(
+            num_transformer_layers=2,
+            hidden_dim=192,
+            num_heads=3,
+            mlp_dim=768,
+            **common_kwargs
+        )
     elif model_config.variant == 'tiny':
-        model = transunet_cls_only_tiny(pretrained=model_config.pretrained,
-            img_height=config.data.img_height, img_width=config.data.img_width, dropout=model_config.dropout)
+        model = create_twostream_cls_only(
+            num_transformer_layers=4,
+            hidden_dim=384,
+            num_heads=6,
+            mlp_dim=1536,
+            **common_kwargs
+        )
     elif model_config.variant == 'small':
-        model = transunet_cls_only_small(pretrained=model_config.pretrained,
-            img_height=config.data.img_height, img_width=config.data.img_width, dropout=model_config.dropout)
+        model = create_twostream_cls_only(
+            num_transformer_layers=6,
+            hidden_dim=512,
+            num_heads=8,
+            mlp_dim=2048,
+            **common_kwargs
+        )
     else:
-        model = transunet_cls_only_base(pretrained=model_config.pretrained,
-            img_height=config.data.img_height, img_width=config.data.img_width, dropout=model_config.dropout)
+        model = create_twostream_cls_only(
+            num_transformer_layers=12,
+            hidden_dim=768,
+            num_heads=12,
+            mlp_dim=3072,
+            **common_kwargs
+        )
         
     model = model.to(device)
-    print(f"模型: TransUNet-ResNet50-ClsOnly-{model_config.variant}")
+    
+    print(f"模型: TwoStream-ClsOnly-{model_config.variant}")
+    print(f"架构: 双流网络 (RGB分支 + 深度分支)")
     print(f"任务: 仅分类 (无分割头)")
+    print(f"输入: RGB(3) + Depth(1) + TargetMask(1) = 5 通道")
     print(f"参数量: {model.get_num_params() / 1e6:.2f}M")
     return model
 
@@ -173,7 +215,7 @@ def train(config: Config):
     val_dirs = config.data.get_full_paths(config.data.val_dirs) if config.data.val_dirs else None
     test_dirs = config.data.get_full_paths(config.data.test_dirs) if config.data.test_dirs else None
     
-    train_loader, val_loader, test_loader = create_dataloaders(
+    train_loader, val_loader, test_loader = create_dataloaders_with_depth(
         train_dirs=train_dirs, val_dirs=val_dirs, test_dirs=test_dirs,
         batch_size=config.data.batch_size, num_workers=config.data.num_workers,
         img_size=(config.data.img_height, config.data.img_width),
@@ -249,19 +291,19 @@ def get_config(preset: str = 'default') -> Config:
             data=DataConfig(batch_size=2, num_workers=0),
             model=ModelConfig(variant='tiny'),
             train=TrainConfig(epochs=5, lr=1e-4, use_amp=False, save_dir=CHECKPOINTS_DIR),
-            exp_name='debug_resnet_cls_only')
+            exp_name='debug_twostream_cls_only')
     elif preset == 'base':
         return Config(
             data=DataConfig(batch_size=4),
             model=ModelConfig(variant='base'),
             train=TrainConfig(epochs=150, lr=5e-5, grad_clip=0.5, save_dir=CHECKPOINTS_DIR),
-            exp_name='transunet_cls_only_base')
+            exp_name='transunet_twostream_cls_only_base')
     else:
         return Config(
             data=DataConfig(data_root='/DATA/disk0/hs_25/pa',
                 train_dirs=['all_dataset/train'], val_dirs=['all_dataset/val'], test_dirs=['all_dataset/test']),
             train=TrainConfig(save_dir=CHECKPOINTS_DIR),
-            exp_name='transunet_cls_only')
+            exp_name='transunet_twostream_cls_only')
 
 
 def main():
@@ -287,8 +329,8 @@ def main():
     if args.no_amp: config.train.use_amp = False
     if args.resume: config.resume_path = args.resume
     
-    print(f"\n{'='*60}\n消融实验: ResNet-50 仅分类\n{'='*60}")
-    print(f"模型: TransUNet-ResNet50-ClsOnly-{config.model.variant}")
+    print(f"\n{'='*60}\n消融实验: 双流网络 仅分类\n{'='*60}")
+    print(f"模型: TwoStream-ClsOnly-{config.model.variant}")
     train(config)
 
 

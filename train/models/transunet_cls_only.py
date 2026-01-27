@@ -185,6 +185,18 @@ def transunet_cls_only_tiny(pretrained: bool = True, **kwargs) -> TransUNetClsOn
     )
 
 
+def transunet_cls_only_micro(pretrained: bool = True, **kwargs) -> TransUNetClsOnly:
+    """TransUNet-ClsOnly-Micro: 2层 Transformer, 192 hidden dim (超轻量级)"""
+    return create_transunet_cls_only(
+        pretrained=pretrained,
+        num_transformer_layers=2,
+        hidden_dim=192,
+        num_heads=3,
+        mlp_dim=768,
+        **kwargs
+    )
+
+
 if __name__ == "__main__":
     model = transunet_cls_only_base()
     print(f"参数量: {model.get_num_params() / 1e6:.2f}M")

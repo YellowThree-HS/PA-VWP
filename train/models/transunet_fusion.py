@@ -512,6 +512,20 @@ def transunet_fusion_small(pretrained: bool = True, **kwargs) -> TransUNetFusion
     )
 
 
+def transunet_fusion_tiny(pretrained: bool = True, **kwargs) -> TransUNetFusion:
+    """TransUNet-Fusion-Tiny: 4 层 Transformer, 384 hidden dim (用于快速实验)"""
+    return create_transunet_fusion(
+        pretrained=pretrained,
+        num_transformer_layers=4,
+        hidden_dim=384,
+        num_heads=6,
+        mlp_dim=1536,
+        use_mask_guided=True,
+        use_decoder_features=True,
+        **kwargs
+    )
+
+
 if __name__ == "__main__":
     # 测试模型
     config = TransUNetFusionConfig()

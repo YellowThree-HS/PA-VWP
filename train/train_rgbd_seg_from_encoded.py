@@ -1,15 +1,15 @@
 """
-TransUNet RGBD Fusion 训练脚本 - 分割感知双路融合 (带深度图)
+TransUNet RGBD Seg-From-Encoded 训练脚本
+分割头直接接在 Transformer Encoded 层后面，不使用 CNN Encoder 跳跃连接
+输入: RGB (3) + Depth (1) + Target Mask (1) = 5 通道
 
 用法:
-    python train_rgbd_fusion.py --config base
-    python train_rgbd_fusion.py --config debug
-    python train_rgbd_fusion.py --config base --epochs 200 --lr 1e-4
+    python train_rgbd_seg_from_encoded.py --config base
+    python train_rgbd_seg_from_encoded.py --config debug
+    python train_rgbd_seg_from_encoded.py --config base --epochs 200 --lr 1e-4
 
-与原版 train_with_depth.py 的区别:
-- 使用 TransUNetRGBDFusion 模型 (分割特征增强分类)
-- 分割掩码引导的注意力池化
-- 分割解码器多尺度特征融合
+与 train_seg_from_encoded.py 的区别:
+- 使用 RGBD 数据集 (5通道输入)
 - 输入: RGB (3) + Depth (1) + Target Mask (1) = 5 通道
 """
 
@@ -36,12 +36,14 @@ from train.dataset_with_depth import (
     get_train_transform_with_depth, 
     get_val_transform_with_depth
 )
-from train.models.transunet_rgbd_fusion import (
-    TransUNetRGBDFusion, 
-    TransUNetRGBDFusionConfig,
-    transunet_rgbd_fusion_base, 
-    transunet_rgbd_fusion_small,
-    transunet_rgbd_fusion_tiny,
+from train.models.transunet_seg_from_encoded import (
+    TransUNetSegFromEncoded, 
+    TransUNetSegFromEncodedConfig,
+    transunet_seg_from_encoded_base, 
+    transunet_seg_from_encoded_small,
+    transunet_seg_from_encoded_tiny,
+    transunet_seg_from_encoded_micro,
+    create_transunet_seg_from_encoded,
 )
 from train.utils import (
     set_seed,
@@ -58,34 +60,54 @@ from train.utils import (
 )
 
 
-def create_model_rgbd_fusion(config: Config, device: torch.device) -> nn.Module:
-    """创建 RGBD 融合模型"""
+def create_model_rgbd_seg_from_encoded(config: Config, device: torch.device) -> nn.Module:
+    """创建 RGBD Seg-From-Encoded 模型 (5通道输入)"""
     model_config = config.model
     
-    if model_config.variant == 'tiny':
-        model = transunet_rgbd_fusion_tiny(
-            pretrained=model_config.pretrained,
-            img_height=config.data.img_height,
-            img_width=config.data.img_width,
-            dropout=model_config.dropout,
+    # 通用参数
+    common_kwargs = dict(
+        pretrained=model_config.pretrained,
+        img_height=config.data.img_height,
+        img_width=config.data.img_width,
+        dropout=model_config.dropout,
+        in_channels=5,  # RGBD: RGB (3) + Depth (1) + Target Mask (1)
+    )
+    
+    if model_config.variant == 'micro':
+        model = create_transunet_seg_from_encoded(
+            num_transformer_layers=2,
+            hidden_dim=192,
+            num_heads=3,
+            mlp_dim=768,
+            **common_kwargs
+        )
+    elif model_config.variant == 'tiny':
+        model = create_transunet_seg_from_encoded(
+            num_transformer_layers=4,
+            hidden_dim=384,
+            num_heads=6,
+            mlp_dim=1536,
+            **common_kwargs
         )
     elif model_config.variant == 'small':
-        model = transunet_rgbd_fusion_small(
-            pretrained=model_config.pretrained,
-            img_height=config.data.img_height,
-            img_width=config.data.img_width,
-            dropout=model_config.dropout,
+        model = create_transunet_seg_from_encoded(
+            num_transformer_layers=6,
+            hidden_dim=512,
+            num_heads=8,
+            mlp_dim=2048,
+            **common_kwargs
         )
     elif model_config.variant == 'base':
-        model = transunet_rgbd_fusion_base(
-            pretrained=model_config.pretrained,
-            img_height=config.data.img_height,
-            img_width=config.data.img_width,
-            dropout=model_config.dropout,
+        model = create_transunet_seg_from_encoded(
+            num_transformer_layers=12,
+            hidden_dim=768,
+            num_heads=12,
+            mlp_dim=3072,
+            **common_kwargs
         )
     else:
         # 自定义配置或默认 base
-        transunet_config = TransUNetRGBDFusionConfig(
+        transunet_config = TransUNetSegFromEncodedConfig(
             img_height=config.data.img_height,
             img_width=config.data.img_width,
             pretrained=model_config.pretrained,
@@ -94,18 +116,18 @@ def create_model_rgbd_fusion(config: Config, device: torch.device) -> nn.Module:
             num_layers=model_config.num_layers,
             mlp_dim=model_config.mlp_dim,
             dropout=model_config.dropout,
-            in_channels=5,  # RGBD + Mask
-            use_mask_guided=True,
-            use_decoder_features=True,
+            in_channels=5,  # RGBD
         )
-        model = TransUNetRGBDFusion(transunet_config)
+        model = TransUNetSegFromEncoded(transunet_config)
         
     model = model.to(device)
     
     # 打印模型信息
     n_params = model.get_num_params() / 1e6
     n_total_params = model.get_num_params(trainable_only=False) / 1e6
-    print(f"模型: TransUNet-RGBD-Fusion-{model_config.variant}")
+    print(f"模型: TransUNet-RGBD-SegFromEncoded-{model_config.variant}")
+    print(f"输入: RGBD 5通道 (RGB + Depth + TargetMask)")
+    print(f"特点: 分割头直接从 Transformer Encoded 特征解码，无 CNN skip connections")
     print(f"可训练参数: {n_params:.2f}M")
     print(f"总参数: {n_total_params:.2f}M")
     
@@ -133,8 +155,8 @@ def train_one_epoch(
     pbar = tqdm(train_loader, desc=f'Train Epoch {epoch}')
     
     for batch_idx, batch in enumerate(pbar):
-        # 获取数据 (RGBD)
-        images = batch['input'].to(device)  # (B, 5, H, W)
+        # 获取数据 - RGBD 数据集
+        images = batch['input'].to(device)  # 5 通道: RGB + Depth + TargetMask
         cls_targets = batch['stability_label'].to(device)
         seg_targets = batch['affected_mask'].to(device)
         
@@ -214,7 +236,7 @@ def validate(
     pbar = tqdm(val_loader, desc='Validate')
     
     for batch in pbar:
-        images = batch['input'].to(device)
+        images = batch['input'].to(device)  # 5 通道: RGB + Depth + TargetMask
         cls_targets = batch['stability_label'].to(device)
         seg_targets = batch['affected_mask'].to(device)
         
@@ -266,7 +288,7 @@ def train(config: Config):
     val_dirs = config.data.get_full_paths(config.data.val_dirs) if config.data.val_dirs else None
     test_dirs = config.data.get_full_paths(config.data.test_dirs) if config.data.test_dirs else None
     
-    # 创建数据加载器 (RGBD)
+    # 创建数据加载器 - 使用 RGBD 数据集
     train_loader, val_loader, test_loader = create_dataloaders_with_depth(
         train_dirs=train_dirs,
         val_dirs=val_dirs,
@@ -281,8 +303,8 @@ def train(config: Config):
     print(f"训练集: {len(train_loader.dataset)} 样本")
     print(f"验证集: {len(val_loader.dataset)} 样本")
     
-    # 创建模型 - 使用 RGBD 融合版本
-    model = create_model_rgbd_fusion(config, device)
+    # 创建模型 - 使用 RGBD Seg-From-Encoded 版本
+    model = create_model_rgbd_seg_from_encoded(config, device)
     
     # 创建损失函数
     criterion = CombinedLoss(
@@ -383,85 +405,9 @@ def train(config: Config):
     return best_f1
 
 
-def get_config_rgbd_fusion(preset: str = 'default') -> Config:
-    """获取 RGBD 融合配置"""
-    if preset == 'debug':
-        return Config(
-            exp_name='transunet_rgbd_fusion_debug',
-            data=DataConfig(
-                data_root='/DATA/disk0/hs_25/pa',
-                train_dirs=['all_dataset/train'],
-                val_dirs=['all_dataset/val'],
-                batch_size=2,
-                num_workers=2,
-            ),
-            model=ModelConfig(variant='small'),
-            train=TrainConfig(epochs=5, lr=1e-4),
-            loss=LossConfig(),
-        )
-    elif preset == 'small':
-        return Config(
-            exp_name='transunet_rgbd_fusion_small',
-            data=DataConfig(
-                data_root='/DATA/disk0/hs_25/pa',
-                train_dirs=['all_dataset/train'],
-                val_dirs=['all_dataset/val'],
-                batch_size=8,
-                num_workers=8,
-            ),
-            model=ModelConfig(variant='small'),
-            train=TrainConfig(epochs=100, lr=1e-4),
-            loss=LossConfig(),
-        )
-    elif preset == 'base':
-        return Config(
-            exp_name='transunet_rgbd_fusion_base',
-            data=DataConfig(
-                data_root='/DATA/disk0/hs_25/pa',
-                train_dirs=['all_dataset/train'],
-                val_dirs=['all_dataset/val'],
-                test_dirs=['all_dataset/test'],
-                batch_size=4,
-                num_workers=8,
-            ),
-            model=ModelConfig(variant='base'),
-            train=TrainConfig(epochs=150, lr=5e-5),
-            loss=LossConfig(),
-        )
-    elif preset == 'full_data':
-        return Config(
-            exp_name='transunet_rgbd_fusion_full',
-            data=DataConfig(
-                data_root='/DATA/disk0/hs_25/pa',
-                train_dirs=['all_dataset/train'],
-                val_dirs=['all_dataset/val'],
-                test_dirs=['all_dataset/test'],
-                batch_size=8,
-                num_workers=8,
-            ),
-            model=ModelConfig(variant='small'),
-            train=TrainConfig(epochs=100, lr=1e-4),
-            loss=LossConfig(),
-        )
-    else:  # default
-        return Config(
-            exp_name='transunet_rgbd_fusion_default',
-            data=DataConfig(
-                data_root='/DATA/disk0/hs_25/pa',
-                train_dirs=['all_dataset/train'],
-                val_dirs=['all_dataset/val'],
-                batch_size=8,
-                num_workers=8,
-            ),
-            model=ModelConfig(variant='small'),
-            train=TrainConfig(epochs=100, lr=1e-4),
-            loss=LossConfig(),
-        )
-
-
 def parse_args():
     """解析命令行参数"""
-    parser = argparse.ArgumentParser(description='TransUNet RGBD Fusion 训练脚本 (分割感知双路融合)')
+    parser = argparse.ArgumentParser(description='TransUNet RGBD Seg-From-Encoded 训练脚本')
     
     # 配置预设
     parser.add_argument('--config', type=str, default='default',
@@ -476,7 +422,7 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=None, help='学习率')
     parser.add_argument('--save_dir', type=str, default=None, help='checkpoint 保存根目录（默认使用数据盘）')
     parser.add_argument('--model', type=str, default=None, 
-                        choices=['tiny', 'small', 'base'], help='模型变体')
+                        choices=['micro', 'tiny', 'small', 'base'], help='模型变体')
     parser.add_argument('--device', type=str, default=None, help='设备 (cuda/cpu)')
     parser.add_argument('--num_workers', type=int, default=None, help='数据加载线程数')
     parser.add_argument('--resume', type=str, default=None, help='恢复训练的检查点路径')
@@ -491,11 +437,14 @@ def main():
     args = parse_args()
     
     # 加载配置
-    config = get_config_rgbd_fusion(args.config)
+    config = get_config(args.config)
     
     # 覆盖配置
     if args.exp_name:
         config.exp_name = args.exp_name
+    else:
+        # 默认实验名称
+        config.exp_name = f'transunet_rgbd_seg_from_encoded_{args.config}'
     if args.data_dirs:
         config.data.train_dirs = args.data_dirs
     if args.batch_size:
@@ -526,15 +475,15 @@ def main():
         
     # 打印配置
     print("\n" + "=" * 60)
-    print("TransUNet RGBD Fusion 训练配置")
+    print("TransUNet RGBD Seg-From-Encoded 训练配置")
     print("=" * 60)
     print(f"实验名称: {config.exp_name}")
     print(f"数据根目录: {config.data.data_root}")
     print(f"训练集: {config.data.train_dirs}")
     print(f"验证集: {config.data.val_dirs if config.data.val_dirs else '从训练集划分'}")
-    print(f"模型: TransUNet-RGBD-Fusion-{config.model.variant}")
-    print(f"输入通道: 5 (RGB + Depth + Target Mask)")
-    print(f"融合策略: Mask-Guided Attention + Multi-Scale Decoder Features")
+    print(f"模型: TransUNet-RGBD-SegFromEncoded-{config.model.variant}")
+    print(f"输入: RGBD 5通道 (RGB + Depth + TargetMask)")
+    print(f"特点: 分割头直接从 Transformer Encoded 特征解码 (无 CNN skip connections)")
     print(f"批次大小: {config.data.batch_size}")
     print(f"训练轮数: {config.train.epochs}")
     print(f"学习率: {config.train.lr}")

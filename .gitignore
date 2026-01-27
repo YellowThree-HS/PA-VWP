@@ -29,9 +29,23 @@ dist/
 *.log
 logs/
 
+# 推理/评测输出（体积可能很大）
+inference_results/
+paper_demo_results/
+paper_eval_results/
+test_results/
+real_images/
+
 # 大文件/资源文件
 assets/cardboard_textures/*.jpg
 assets/cardboard_textures/*.png
+*.pth
+*.pt
+*.ckpt
+*.npy
+
+# 论文/演示中间产物（通常是生成文件，不进仓库）
+paper/demo_paper/
 
 # 数据集
 dataset/
