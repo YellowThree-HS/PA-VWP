@@ -1,0 +1,21 @@
+{
+  "safety_precision": 0.8431134083222548,
+  "safety_recall": 0.8965405754833867,
+  "f1_score": 0.8690065810000104,
+  "accuracy": 0.8406506131212869,
+  "unstable_precision": 0.8365122615661357,
+  "unstable_recall": 0.7603715170160933,
+  "miou_affected": 0.0,
+  "global_iou": 0.0,
+  "dice": 0.0,
+  "boundary_f_measure": 0.0,
+  "n_samples": 15739,
+  "n_unstable_samples": 0,
+  "n_stable_samples": 15739,
+  "confusion_matrix": {
+    "tp_safe": 8319,
+    "fp_safe": 1548,
+    "tn_safe": 4912,
+    "fn_safe": 960
+  }
+}
