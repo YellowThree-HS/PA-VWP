@@ -33,6 +33,8 @@ logs/
 inference_results/
 paper_demo_results/
 paper_eval_results/
+!paper_eval_results/results/
+!paper_eval_results/results/**
 test_results/
 real_images/
 
